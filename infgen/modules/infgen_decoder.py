@@ -49,6 +49,7 @@ class InfGenDecoder(nn.Module):
                  buffer_size: int=32,
                  num_recurrent_steps_val: int=-1,
                  loss_weight: dict=None,
+                 paper_objective: bool=False,
                  logger=None) -> None:
 
         super(InfGenDecoder, self).__init__()
@@ -99,6 +100,7 @@ class InfGenDecoder(nn.Module):
             buffer_size=buffer_size,
             num_recurrent_steps_val=num_recurrent_steps_val,
             loss_weight=loss_weight,
+            paper_objective=paper_objective,
             logger=logger,
         )
         self.map_enc = None

@@ -1,0 +1,15 @@
+{
+  "upstream_repository": "https://github.com/OrangeSodahub/InfGen",
+  "upstream_commit": "68f643c0cd464e908fac0ef79f82d55b5e6edc90",
+  "paper_url": "https://orangesodahub.github.io/InfGen/assets/infgen_preprint.pdf",
+  "paper_sha256": "ea0cd73fd9b91e186aadff0e963f6ccbcae1949016b7898e5901773328ad994e",
+  "assets_sha256": {
+    "infgen/tokens/agent_vocab_555_s2.pkl": "e6bf8eff32497eaefca66f488dda1edefe97ed2696d1d23c01839dc27422408e",
+    "infgen/tokens/map_traj_token5.pkl": "efc4aa79d57cd60aba257bbb2cc2262e13043d545f5e02d9b483a5c1d1926d8a"
+  },
+  "tested_runtime": {
+    "platform": "macOS-26.6-arm64-arm-64bit",
+    "python": "3.10.17",
+    "torch": "2.5.1"
+  }
+}

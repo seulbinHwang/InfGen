@@ -20,6 +20,28 @@ AGENT_TYPE = ['veh', 'ped', 'cyc', 'seed']
 AGENT_STATE = ['invalid', 'valid', 'enter', 'exit']
 
 
+def control_states_from_validity(validity, state_token):
+    """Appendix C, Eq. 14: ADD at first valid, REMOVE at last valid.
+
+    A final-horizon REMOVE becomes KEEP. Empty tracks remain invalid. For a
+    single valid segment, ADD takes precedence because one token cannot encode
+    both ADD and REMOVE; see docs/data_audit.md for this otherwise undefined case.
+    """
+    if validity.ndim != 2 or validity.shape[1] == 0:
+        raise ValueError('Expected nonempty [agent, token-step] validity')
+    validity = validity.bool()
+    has_valid = validity.any(dim=1)
+    first = validity.long().argmax(dim=1)
+    last = validity.shape[1] - 1 - validity.flip(1).long().argmax(dim=1)
+    step = torch.arange(validity.shape[1], device=validity.device)[None, :]
+    inside = has_valid[:, None] & (step >= first[:, None]) & (step <= last[:, None])
+    states = torch.full_like(validity, int(state_token['invalid']), dtype=torch.long)
+    states[inside] = int(state_token['valid'])
+    states[has_valid[:, None] & (step == last[:, None]) & (step != validity.shape[1] - 1)] = int(state_token['exit'])
+    states[has_valid[:, None] & (step == first[:, None])] = int(state_token['enter'])
+    return states
+
+
 @torch.no_grad()
 def cal_polygon_contour(pos, head, width_length) -> torch.Tensor:  # [n_agent, n_step, n_target, 4, 2]
     x, y = pos[..., 0], pos[..., 1]  # [n_agent, n_step, n_target]
@@ -56,26 +78,25 @@ def cal_polygon_contour(pos, head, width_length) -> torch.Tensor:  # [n_agent, n
 
 
 def interplating_polyline(polylines, heading, distance=0.5, split_distace=5):
-    # Calculate the cumulative distance along the path, up-sample the polyline to 0.5 meter
-    dist_along_path_list = [[0]]
+    # Preserve the released tokenizer's 0.5m sampling and 5m segments. Skip
+    # duplicate vertices because scipy interpolation requires unique distances.
+    polylines = np.asarray(polylines)
+    heading = np.asarray(heading)
+    if distance <= 0 or split_distace < distance:
+        raise ValueError('Require distance > 0 and split_distace >= distance')
+    if polylines.ndim != 2 or polylines.shape[-1] < 2 or len(heading) != len(polylines):
+        raise ValueError('Expected aligned [point, xy...] polyline and [point] headings')
+    if len(polylines) < 2:
+        return None
+    dist_along_path_list = [[0.0]]
     polylines_list = [[polylines[0]]]
     for i in range(1, polylines.shape[0]):
         euclidean_dist = euclidean(polylines[i, :2], polylines[i - 1, :2])
-        heading_diff = min(abs(max(heading[i], heading[i - 1]) - min(heading[1], heading[i - 1])),
-                           abs(max(heading[i], heading[i - 1]) - min(heading[1], heading[i - 1]) + math.pi))
-        if heading_diff > math.pi / 4 and euclidean_dist > 3:
-            dist_along_path_list.append([0])
+        heading_diff = abs((float(heading[i] - heading[i - 1]) + math.pi) % (2 * math.pi) - math.pi)
+        if (heading_diff > 0.1 and euclidean_dist > 3) or euclidean_dist > 10:
+            dist_along_path_list.append([0.0])
             polylines_list.append([polylines[i]])
-        elif heading_diff > math.pi / 8 and euclidean_dist > 3:
-            dist_along_path_list.append([0])
-            polylines_list.append([polylines[i]])
-        elif heading_diff > 0.1 and euclidean_dist > 3:
-            dist_along_path_list.append([0])
-            polylines_list.append([polylines[i]])
-        elif euclidean_dist > 10:
-            dist_along_path_list.append([0])
-            polylines_list.append([polylines[i]])
-        else:
+        elif euclidean_dist > 0:
             dist_along_path_list[-1].append(dist_along_path_list[-1][-1] + euclidean_dist)
             polylines_list[-1].append(polylines[i])
     # plt.plot(polylines[:, 0], polylines[:, 1])
@@ -121,7 +142,8 @@ def interplating_polyline(polylines, heading, distance=0.5, split_distace=5):
         if new_polylines.shape[0] >= (polyline_size + 1):
             multi_polylines = new_polylines.unfold(dimension=0, size=polyline_size + 1, step=polyline_size)
             multi_polylines = multi_polylines.transpose(1, 2)
-            multi_polylines = multi_polylines[:, ::5, :]
+            sample_indices = torch.linspace(0, polyline_size, steps=3).long()
+            multi_polylines = multi_polylines[:, sample_indices, :]
         if padding_size >= 3:
             last_polyline = new_polylines[final_index * polyline_size:]
             last_polyline = last_polyline[torch.linspace(0, last_polyline.shape[0] - 1, steps=3).long()]
@@ -274,7 +296,6 @@ class TokenProcessor(nn.Module):
         self.noise = False
         self.disturb = False
         self.shift = 5
-        self.training = False
         self.current_step = 10
 
         # debugging
@@ -284,18 +305,34 @@ class TokenProcessor(nn.Module):
         """
         Each pkl data represents a extracted scenario from raw tfrecord data
         """
-        data['agent']['av_index'] = data['agent']['av_idx']
+        raw_av_index = data['agent']['av_idx']
+        # Later model preparation adds graph offsets in place. Keep local input
+        # indices independent so repeated tokenization cannot accumulate offsets.
+        data['agent']['av_index'] = raw_av_index.clone() if torch.is_tensor(raw_av_index) else raw_av_index
         data = self._tokenize_agent(data)
         # data = self._tokenize_map(data)
-        del data['city']
+        data.pop('city', None)
         if 'polygon_is_intersection' in data['map_polygon']:
             del data['map_polygon']['polygon_is_intersection']
         if 'route_type' in data['map_polygon']:
             del data['map_polygon']['route_type']
 
-        av_index = int(data['agent']['av_idx'])
-        data['ego_pos'] = data['agent']['token_pos'][[av_index]]
-        data['ego_heading'] = data['agent']['token_heading'][[av_index]]
+        local_av_index = torch.as_tensor(
+            data['agent']['av_idx'], dtype=torch.long,
+            device=data['agent']['token_pos'].device).reshape(-1)
+        graph_ptr = data['agent'].get('ptr')
+        if graph_ptr is not None:
+            if local_av_index.numel() != graph_ptr.numel() - 1:
+                raise ValueError('Expected one local ego index for each graph')
+            if torch.any((local_av_index < 0) | (local_av_index >= graph_ptr.diff())):
+                raise ValueError('Local ego index is outside its graph')
+            global_av_index = local_av_index + graph_ptr[:-1]
+        else:
+            if local_av_index.numel() != 1:
+                raise ValueError('Multiple ego indices require graph batch offsets')
+            global_av_index = local_av_index
+        data['ego_pos'] = data['agent']['token_pos'][global_av_index]
+        data['ego_heading'] = data['agent']['token_heading'][global_av_index]
 
         return data
 
@@ -371,6 +408,24 @@ class TokenProcessor(nn.Module):
         agent_type = data['agent']['type']
         agent_category = data['agent']['category']
 
+        # Keep observations separate from backward extrapolation. In particular,
+        # a first future sighting must not manufacture an agent visible now.
+        observed_valid_mask = valid_mask.clone()
+        data['agent']['observed_valid_mask'] = observed_valid_mask
+        history_valid = observed_valid_mask[:, :self.current_step + 1].clone()
+        history_valid, _, _, _ = self._extrapolate_agent_to_prev_token_step(
+            history_valid, agent_pos[:, :self.current_step + 1].clone(),
+            agent_heading[:, :self.current_step + 1].clone(),
+            agent_vel[:, :self.current_step + 1].clone(),
+        )
+        history_segments = history_valid.unfold(1, self.shift + 1, self.shift)
+        history_state_index = control_states_from_validity(
+            history_segments[:, :, 0] & history_segments[:, :, -1], {
+                'invalid': self.invalid_state, 'valid': self.valid_state,
+                'enter': self.enter_state, 'exit': self.exit_state,
+            })
+        data['agent']['history_state_idx'] = history_state_index
+
         n_agent, n_all_step = valid_mask.shape
 
         agent_type_masks = {
@@ -431,15 +486,10 @@ class TokenProcessor(nn.Module):
         # token_index[cyclist_mask] = cyc_token_index
 
         # ! compute agent states
-        bos_index = torch.argmax(token_valid_mask.long(), dim=1)
-        eos_index = token_valid_mask.shape[1] - 1 - torch.argmax(torch.flip(token_valid_mask.long(), dims=[1]), dim=1)
-        state_index = torch.ones_like(token_index)  # init with all valid
-        step_index = torch.arange(state_index.shape[1])[None].repeat(state_index.shape[0], 1).to(token_index.device)
-        state_index[step_index == bos_index[:, None]] = self.enter_state
-        state_index[step_index == eos_index[:, None]] = self.exit_state
-        state_index[(step_index < bos_index[:, None]) | (step_index > eos_index[:, None])] = self.invalid_state
-        # ! IMPORTANT: if the last step is exit token, should convert it back to valid token
-        state_index[state_index[:, -1] == self.exit_state, -1] = self.valid_state
+        state_index = control_states_from_validity(token_valid_mask, {
+            'invalid': self.invalid_state, 'valid': self.valid_state,
+            'enter': self.enter_state, 'exit': self.exit_state,
+        })
 
         # update token attributions according to state tokens
         token_valid_mask[state_index == self.enter_state] = False
@@ -518,17 +568,33 @@ class TokenProcessor(nn.Module):
 
         # reset agent shapes
         for i in range(n_agent):
-            bos_shape_index = torch.nonzero(torch.all(data['agent']['shape'][i] != 0., dim=-1))[0]
-            data['agent']['shape'][i, :] = data['agent']['shape'][i, bos_shape_index]
-        if torch.any(torch.all(data['agent']['shape'][i] == 0., dim=-1)):
-            raise ValueError(f"Found invalid shape values.")
+            valid_shape = torch.isfinite(data['agent']['shape'][i]).all(dim=-1) & (data['agent']['shape'][i] > 0).all(dim=-1)
+            historical_shape = valid_shape.clone()
+            historical_shape[self.current_step + 1:] = False
+            historical_shape &= observed_valid_mask[i]
+            # Seen agents use only observed historical attributes. Future-only
+            # tracks still need shape targets for scene-generation training.
+            shape_steps = torch.nonzero(historical_shape if historical_shape.any() else valid_shape,
+                                        as_tuple=False).flatten()
+            if shape_steps.numel() == 0:
+                raise ValueError(f'Agent {i} has no finite, positive shape observation')
+            data['agent']['shape'][i, :] = data['agent']['shape'][i, shape_steps[0]].clone()
 
-        # compute mean height values for each scenario
+        # A category may be absent at t=1s. Fall back to the observed scene height
+        # rather than propagate a NaN into generated-agent trajectories.
         raw_height = data['agent']['position'][:, self.current_step, 2]
-        valid_height = raw_token_valid_mask[:, 1].bool()
-        veh_mean_z = raw_height[agent_type_masks['veh'] & valid_height].mean()
-        ped_mean_z = raw_height[agent_type_masks['ped'] & valid_height].mean().nan_to_num_(veh_mean_z)  # FIXME: hard code
-        cyc_mean_z = raw_height[agent_type_masks['cyc'] & valid_height].mean().nan_to_num_(veh_mean_z)
+        valid_height = observed_valid_mask[:, self.current_step] & torch.isfinite(raw_height)
+        all_heights = data['agent']['position'][..., 2]
+        height_observations = observed_valid_mask.clone()
+        height_observations[:, self.current_step + 1:] = False
+        observed_heights = all_heights[height_observations & torch.isfinite(all_heights)]
+        scene_mean_z = observed_heights.mean() if observed_heights.numel() else raw_height.new_zeros(())
+        vehicle_heights = raw_height[agent_type_masks['veh'] & valid_height]
+        veh_mean_z = vehicle_heights.mean() if vehicle_heights.numel() else scene_mean_z
+        ped_heights = raw_height[agent_type_masks['ped'] & valid_height]
+        cyc_heights = raw_height[agent_type_masks['cyc'] & valid_height]
+        ped_mean_z = ped_heights.mean() if ped_heights.numel() else veh_mean_z
+        cyc_mean_z = cyc_heights.mean() if cyc_heights.numel() else veh_mean_z
 
         # output
         data['agent']['token_idx'] = token_index
@@ -564,6 +630,9 @@ class TokenProcessor(nn.Module):
         """
 
         n_agent, n_step = valid_mask.shape
+        n_token_steps = (n_step - 1) // self.shift
+        if n_token_steps < 1:
+            raise ValueError(f"Need at least {self.shift + 1} frames for one motion token")
 
         # agent_token_src = self.trajectory_token[category]
         # if self.shift <= 2:
@@ -658,9 +727,9 @@ class TokenProcessor(nn.Module):
             token_all = torch.stack(token_all, dim=1)  # [n_agent, n_step, 6, 4, 2]
 
         # sanity check
-        assert tuple(token_index.shape) == (n_agent, n_step // self.shift), \
+        assert tuple(token_index.shape) == (n_agent, n_token_steps), \
             f'Invalid token_index shape, got {token_index.shape}'
-        assert tuple(token_contour.shape )== (n_agent, n_step // self.shift, token_contour_dim, feat_dim), \
+        assert tuple(token_contour.shape )== (n_agent, n_token_steps, token_contour_dim, feat_dim), \
             f'Invalid token_contour shape, got {token_contour.shape}'
 
         # extra matching
@@ -741,12 +810,20 @@ class TokenProcessor(nn.Module):
                     pl_idx_list.append(new_cur_pl_idx)
                     split_polygon_type.append(map_polygon_type)
 
-        split_polyline_pos = torch.cat(split_polyline_pos, dim=0)
-        split_polyline_theta = torch.cat(split_polyline_theta, dim=0)
-        split_polyline_type = torch.cat(split_polyline_type, dim=0)
-        split_polyline_side = torch.cat(split_polyline_side, dim=0)
-        split_polygon_type = torch.cat(split_polygon_type, dim=0)
-        pl_idx_list = torch.cat(pl_idx_list, dim=0)
+        if split_polyline_pos:
+            split_polyline_pos = torch.cat(split_polyline_pos, dim=0)
+            split_polyline_theta = torch.cat(split_polyline_theta, dim=0)
+            split_polyline_type = torch.cat(split_polyline_type, dim=0)
+            split_polyline_side = torch.cat(split_polyline_side, dim=0)
+            split_polygon_type = torch.cat(split_polygon_type, dim=0)
+            pl_idx_list = torch.cat(pl_idx_list, dim=0)
+        else:
+            split_polyline_pos = pt_pos.new_empty((0, 3, 2))
+            split_polyline_theta = pt_heading.new_empty((0, 3))
+            split_polyline_type = pt_type.new_empty((0,))
+            split_polyline_side = pt_side.new_empty((0,))
+            split_polygon_type = data['map_polygon']['type'].new_empty((0,))
+            pl_idx_list = pt_type.new_empty((0,), dtype=torch.long)
 
         data['map_save'] = {}
         data['pt_token'] = {}

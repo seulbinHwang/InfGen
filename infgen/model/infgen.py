@@ -1,5 +1,6 @@
 import os
 import contextlib
+import logging
 import pytorch_lightning as pl
 import math
 import numpy as np
@@ -14,22 +15,31 @@ from torch.optim.lr_scheduler import LambdaLR
 from collections import defaultdict
 
 from infgen.utils.func import angle_between_2d_vectors
-from infgen.modules.layers import OccLoss
+from infgen.modules.layers import OccLoss, masked_loss
 from infgen.modules.attr_tokenizer import Attr_Tokenizer
 from infgen.modules.infgen_decoder import InfGenDecoder
 from infgen.datasets.preprocess import TokenProcessor
-from infgen.metrics.compute_metrics import *
 from infgen.utils.metrics import *
 from infgen.utils.visualization import *
 from infgen.utils.func import wrap_angle
+
+
+def get_scenario_id_int_tensor(scenario_ids):
+    """Encode IDs for rollout export without importing the metrics runtime."""
+    width = max(16, max((len(identifier) for identifier in scenario_ids), default=0))
+    encoded = torch.full((len(scenario_ids), width), -1, dtype=torch.int32)
+    for row, identifier in enumerate(scenario_ids):
+        encoded[row, :len(identifier)] = torch.tensor([ord(char) for char in identifier], dtype=torch.int32)
+    return encoded
 
 
 class InfGen(pl.LightningModule):
 
     def __init__(self, model_config, save_path: os.PathLike="", logger=None, **kwargs) -> None:
         super(InfGen, self).__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['logger'])
         self.model_config = model_config
+        self.paper_objective = bool(getattr(model_config, 'paper_objective', False))
         self.warmup_steps = model_config.warmup_steps
         self.lr = model_config.lr
         self.total_steps = model_config.total_steps
@@ -72,7 +82,7 @@ class InfGen(pl.LightningModule):
             if hasattr(model_config, 'disable_state_token') else False
         self.use_state_token = not self.disable_state_token
 
-        self.disable_insertion = getattr(model_config, 'disable_insertiion') \
+        self.disable_insertion = getattr(model_config, 'disable_insertion') \
             if hasattr(model_config, 'disable_insertion') else False
 
         self.token_processer = TokenProcessor(self.token_size,
@@ -86,7 +96,8 @@ class InfGen(pl.LightningModule):
         self.attr_tokenizer = Attr_Tokenizer(grid_range=self.model_config.grid_range,
                                              grid_interval=self.model_config.grid_interval,
                                              radius=model_config.decoder.pl2seed_radius,
-                                             angle_interval=self.model_config.angle_interval)
+                                             angle_interval=self.model_config.angle_interval,
+                                             nearest_heading=self.paper_objective)
 
         # state tokens
         self.invalid_state = int(self.model_config.state_token['invalid'])
@@ -131,8 +142,10 @@ class InfGen(pl.LightningModule):
             buffer_size=model_config.decoder.buffer_size,
             num_recurrent_steps_val=model_config.num_recurrent_steps_val,
             loss_weight=model_config.loss_weight,
+            paper_objective=self.paper_objective,
             logger=logger,
         )
+        self.encoder.agent_encoder.paper_objective = self.paper_objective
         self.minADE = minADE(max_guesses=1)
         self.minFDE = minFDE(max_guesses=1)
         self.TokenCls = TokenCls(max_guesses=1)
@@ -144,7 +157,8 @@ class InfGen(pl.LightningModule):
         # self.NumInsertAccuracy = NumInsertAccuracy()
         self.loss_weight = model_config.loss_weight
 
-        self.token_cls_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
+        smoothing = 0.0 if self.paper_objective else 0.1
+        self.token_cls_loss = nn.CrossEntropyLoss(label_smoothing=smoothing)
         if self.predict_map:
             self.map_token_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
         if self.predict_state:
@@ -153,8 +167,8 @@ class InfGen(pl.LightningModule):
             self.state_cls_loss_seed = nn.CrossEntropyLoss(
                 torch.tensor(self.loss_weight['seed_state_weight']))
             self.type_cls_loss_seed = nn.CrossEntropyLoss(
-                torch.tensor(self.loss_weight['seed_type_weight']))
-            self.pos_cls_loss_seed = nn.CrossEntropyLoss(label_smoothing=0.1)
+                None if self.paper_objective else torch.tensor(self.loss_weight['seed_type_weight']))
+            self.pos_cls_loss_seed = nn.CrossEntropyLoss(label_smoothing=smoothing)
             self.head_cls_loss_seed = nn.CrossEntropyLoss()
             self.offset_reg_loss_seed = nn.MSELoss()
             self.shape_reg_loss_seed = nn.MSELoss()
@@ -189,6 +203,8 @@ class InfGen(pl.LightningModule):
         self._mode = mode
 
         if mode == 'validation':
+            from infgen.metrics.compute_metrics import LongMetric
+
             self._online_metric = True
             self._save_validate_reuslts = True
             self._long_metrics = LongMetric('val_close_long')
@@ -219,7 +235,7 @@ class InfGen(pl.LightningModule):
         return res
 
     def maybe_autocast(self, dtype=torch.float16):
-        enable_autocast = self.device != torch.device("cpu")
+        enable_autocast = self.device.type == "cuda"
 
         if enable_autocast:
             return torch.cuda.amp.autocast(dtype=dtype)
@@ -281,10 +297,8 @@ class InfGen(pl.LightningModule):
             pt_occ_gt = pred['pt_occ_gt']
             pt_occ_eval_mask = pred['pt_occ_eval_mask']
 
-            agent_occ_cls_loss = self.occ_cls_loss(agent_occ[agent_occ_eval_mask],
-                                                   agent_occ_gt[agent_occ_eval_mask])
-            pt_occ_cls_loss = self.occ_cls_loss(pt_occ[pt_occ_eval_mask],
-                                                pt_occ_gt[pt_occ_eval_mask])
+            agent_occ_cls_loss = masked_loss(self.occ_cls_loss, agent_occ, agent_occ_gt, agent_occ_eval_mask)
+            pt_occ_cls_loss = masked_loss(self.occ_cls_loss, pt_occ, pt_occ_gt, pt_occ_eval_mask)
             self.log('agent_occ_cls_loss', agent_occ_cls_loss, **log_params)
             self.log('pt_occ_cls_loss', pt_occ_cls_loss, **log_params)
             loss = loss + agent_occ_cls_loss + pt_occ_cls_loss
@@ -335,8 +349,7 @@ class InfGen(pl.LightningModule):
             next_token_eval_mask = pred['next_token_eval_mask'] # (a, t)
             next_token_eval_mask &= train_mask[:, None]
 
-            token_cls_loss = self.token_cls_loss(next_token_prob[next_token_eval_mask],
-                                                 next_token_idx_gt[next_token_eval_mask]) * self.loss_weight['token_cls_loss']
+            token_cls_loss = masked_loss(self.token_cls_loss, next_token_prob, next_token_idx_gt, next_token_eval_mask) * self.loss_weight['token_cls_loss']
             self.log('token_cls_loss', token_cls_loss, **log_params)
 
             loss = loss + token_cls_loss
@@ -351,7 +364,7 @@ class InfGen(pl.LightningModule):
                     prob = next_token_prob[index[:, 0], index[:, 1]]
                     gt = next_token_idx_gt[index[:, 0], index[:, 1]]
                     mask = next_token_eval_mask[index[:, 0], index[:, 1]]
-                    step_token_cls_loss = self.token_cls_loss(prob[mask], gt[mask])
+                    step_token_cls_loss = masked_loss(self.token_cls_loss, prob, gt, mask)
                     self.log(f's{i}', step_token_cls_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
 
         # state token loss
@@ -362,8 +375,7 @@ class InfGen(pl.LightningModule):
             next_state_idx_gt = pred['next_state_idx_gt']
             next_state_eval_mask = pred['next_state_eval_mask'] # (num_agent, num_timestep)
 
-            state_cls_loss = self.state_cls_loss(next_state_prob[next_state_eval_mask],
-                                                 next_state_idx_gt[next_state_eval_mask]) * self.loss_weight['state_cls_loss']
+            state_cls_loss = masked_loss(self.state_cls_loss, next_state_prob, next_state_idx_gt, next_state_eval_mask) * self.loss_weight['state_cls_loss']
             if torch.isnan(state_cls_loss):
                 print("Found NaN in state_cls_loss!!!")
                 print(next_state_prob.shape)
@@ -385,18 +397,15 @@ class InfGen(pl.LightningModule):
             next_attr_eval_mask_seed = pred['next_attr_eval_mask_seed']
             next_head_eval_mask_seed    = pred['next_head_eval_mask_seed']
 
-            # when num_seed_gt=0 loss term will be NaN
-            state_cls_loss_seed = self.state_cls_loss_seed(next_state_prob_seed[next_state_eval_mask_seed],
-                                                           next_state_idx_gt_seed[next_state_eval_mask_seed]) * self.loss_weight['state_cls_loss']
-            state_cls_loss_seed = torch.nan_to_num(state_cls_loss_seed)
+            # Scenes without insertions contribute zero attribute loss.
+            state_cls_loss_seed = masked_loss(self.state_cls_loss_seed, next_state_prob_seed, next_state_idx_gt_seed, next_state_eval_mask_seed) * self.loss_weight['state_cls_loss']
+
             self.log('seed_state_cls_loss', state_cls_loss_seed, **log_params)
 
-            type_cls_loss_seed = self.type_cls_loss_seed(next_type_prob_seed[next_attr_eval_mask_seed],
-                                                         next_type_idx_gt_seed[next_attr_eval_mask_seed]) * self.loss_weight['type_cls_loss']
-            shape_reg_loss_seed = self.shape_reg_loss_seed(next_shape_seed[next_attr_eval_mask_seed],
-                                                           next_shape_gt_seed[next_attr_eval_mask_seed]) * self.loss_weight['shape_reg_loss']
-            type_cls_loss_seed = torch.nan_to_num(type_cls_loss_seed)
-            shape_reg_loss_seed = torch.nan_to_num(shape_reg_loss_seed)
+            type_cls_loss_seed = masked_loss(self.type_cls_loss_seed, next_type_prob_seed, next_type_idx_gt_seed, next_attr_eval_mask_seed) * self.loss_weight['type_cls_loss']
+            shape_reg_loss_seed = masked_loss(self.shape_reg_loss_seed, next_shape_seed, next_shape_gt_seed, next_attr_eval_mask_seed) * self.loss_weight['shape_reg_loss']
+
+
             self.log('seed_type_cls_loss', type_cls_loss_seed, **log_params)
             self.log('seed_shape_reg_loss', shape_reg_loss_seed, **log_params)
 
@@ -409,22 +418,21 @@ class InfGen(pl.LightningModule):
                 next_offset_xy_seed         = pred['next_offset_xy_seed']
                 next_offset_xy_gt_seed      = pred['next_offset_xy_gt_seed']
 
-                pos_cls_loss_seed = self.pos_cls_loss_seed(next_pos_rel_prob_seed[next_attr_eval_mask_seed],
-                                                           next_pos_rel_index_gt_seed[next_attr_eval_mask_seed]) * self.loss_weight['pos_cls_loss']
-                offset_reg_loss_seed = self.offset_reg_loss_seed(next_offset_xy_seed[next_head_eval_mask_seed],
-                                                                next_offset_xy_gt_seed[next_head_eval_mask_seed]) * self.loss_weight['offset_reg_loss']
-                pos_cls_loss_seed = torch.nan_to_num(pos_cls_loss_seed)
+                pos_cls_loss_seed = masked_loss(self.pos_cls_loss_seed, next_pos_rel_prob_seed, next_pos_rel_index_gt_seed, next_attr_eval_mask_seed) * self.loss_weight['pos_cls_loss']
+                offset_reg_loss_seed = masked_loss(self.offset_reg_loss_seed, next_offset_xy_seed, next_offset_xy_gt_seed, next_head_eval_mask_seed) * self.loss_weight['offset_reg_loss']
+
                 self.log('seed_pos_cls_loss', pos_cls_loss_seed, **log_params)
                 self.log('seed_offset_reg_loss', offset_reg_loss_seed, **log_params)
 
-                loss = loss + pos_cls_loss_seed + offset_reg_loss_seed
+                loss = loss + pos_cls_loss_seed
+                if not self.paper_objective:
+                    loss = loss + offset_reg_loss_seed
 
             else:
                 next_pos_rel_xy_seed       = pred['next_pos_rel_xy_seed']
                 next_pos_rel_xy_gt_seed    = pred['next_pos_rel_xy_gt_seed']
-                pos_reg_loss_seed = self.pos_reg_loss_seed(next_pos_rel_xy_seed[next_attr_eval_mask_seed],
-                                                           next_pos_rel_xy_gt_seed[next_attr_eval_mask_seed]) * self.loss_weight['pos_reg_loss']
-                pos_reg_loss_seed = torch.nan_to_num(pos_reg_loss_seed)
+                pos_reg_loss_seed = masked_loss(self.pos_reg_loss_seed, next_pos_rel_xy_seed, next_pos_rel_xy_gt_seed, next_attr_eval_mask_seed) * self.loss_weight['pos_reg_loss']
+
                 self.log('seed_pos_reg_loss', pos_reg_loss_seed, **log_params)
 
                 loss = loss + pos_reg_loss_seed
@@ -433,8 +441,7 @@ class InfGen(pl.LightningModule):
                 next_head_rel_prob_seed     = pred['next_head_rel_prob_seed']
                 next_head_rel_index_gt_seed = pred['next_head_rel_index_gt_seed']
 
-                head_cls_loss_seed = self.head_cls_loss_seed(next_head_rel_prob_seed[next_head_eval_mask_seed],
-                                                             next_head_rel_index_gt_seed[next_head_eval_mask_seed]) * self.loss_weight['head_cls_loss']
+                head_cls_loss_seed = masked_loss(self.head_cls_loss_seed, next_head_rel_prob_seed, next_head_rel_index_gt_seed, next_head_eval_mask_seed) * self.loss_weight['head_cls_loss']
                 self.log('seed_head_cls_loss', head_cls_loss_seed, **log_params)
 
                 loss = loss + head_cls_loss_seed
@@ -443,8 +450,7 @@ class InfGen(pl.LightningModule):
                 next_head_rel_theta_seed    = pred['next_head_rel_theta_seed']
                 next_head_rel_theta_gt_seed = pred['next_head_rel_theta_gt_seed']
 
-                head_reg_loss_seed = self.head_reg_loss_seed(next_head_rel_theta_seed[next_head_eval_mask_seed],
-                                                             next_head_rel_theta_gt_seed[next_head_eval_mask_seed]) * self.loss_weight['head_reg_loss']
+                head_reg_loss_seed = masked_loss(self.head_reg_loss_seed, next_head_rel_theta_seed, next_head_rel_theta_gt_seed, next_head_eval_mask_seed) * self.loss_weight['head_reg_loss']
                 self.log('seed_head_reg_loss', head_reg_loss_seed, **log_params)
 
                 loss = loss + head_reg_loss_seed
@@ -476,7 +482,7 @@ class InfGen(pl.LightningModule):
                                             save_path=self.save_path,
                                             prefix=f'training_{self.global_step:06d}_')
 
-        if self.predict_occ:
+        if self.predict_occ and not self.paper_objective:
 
             neighbor_agent_grid_idx             = pred['neighbor_agent_grid_idx']
             neighbor_agent_grid_index_gt        = pred['neighbor_agent_grid_index_gt']
@@ -485,10 +491,8 @@ class InfGen(pl.LightningModule):
             neighbor_pt_grid_index_gt           = pred['neighbor_pt_grid_index_gt']
             neighbor_pt_grid_index_eval_mask    = pred['neighbor_pt_grid_index_eval_mask']
 
-            neighbor_agent_grid_cls_loss = self.occ_cls_loss(neighbor_agent_grid_idx[neighbor_agent_grid_index_eval_mask],
-                                                             neighbor_agent_grid_index_gt[neighbor_agent_grid_index_eval_mask])
-            neighbor_pt_grid_cls_loss = self.occ_cls_loss(neighbor_pt_grid_idx[neighbor_pt_grid_index_eval_mask],
-                                                          neighbor_pt_grid_index_gt[neighbor_pt_grid_index_eval_mask])
+            neighbor_agent_grid_cls_loss = masked_loss(self.occ_cls_loss, neighbor_agent_grid_idx, neighbor_agent_grid_index_gt, neighbor_agent_grid_index_eval_mask)
+            neighbor_pt_grid_cls_loss = masked_loss(self.occ_cls_loss, neighbor_pt_grid_idx, neighbor_pt_grid_index_gt, neighbor_pt_grid_index_eval_mask)
             # self.log('neighbor_agent_grid_cls_loss', neighbor_agent_grid_cls_loss, **log_params)
             # self.log('neighbor_pt_grid_cls_loss', neighbor_pt_grid_cls_loss, **log_params)
             # loss = loss + neighbor_agent_grid_cls_loss + neighbor_pt_grid_cls_loss
@@ -525,10 +529,8 @@ class InfGen(pl.LightningModule):
                grid_pt_occ_gt_seed.min() < 0 or grid_pt_occ_gt_seed.max() > 1:
                    raise RuntimeError("Occurred invalid values in occ gt")
 
-            agent_occ_loss = self.agent_occ_loss_seed(grid_agent_occ_seed[grid_agent_occ_eval_mask_seed],
-                                                      grid_agent_occ_gt_seed[grid_agent_occ_eval_mask_seed]) * self.loss_weight['agent_occ_loss']
-            pt_occ_loss = self.pt_occ_loss_seed(grid_pt_occ_seed[grid_pt_occ_eval_mask_seed],
-                                                grid_pt_occ_gt_seed[grid_pt_occ_eval_mask_seed]) * self.loss_weight['pt_occ_loss']
+            agent_occ_loss = masked_loss(self.agent_occ_loss_seed, grid_agent_occ_seed, grid_agent_occ_gt_seed, grid_agent_occ_eval_mask_seed) * self.loss_weight['agent_occ_loss']
+            pt_occ_loss = masked_loss(self.pt_occ_loss_seed, grid_pt_occ_seed, grid_pt_occ_gt_seed, grid_pt_occ_eval_mask_seed) * self.loss_weight['pt_occ_loss']
 
             self.log('agent_occ_loss', agent_occ_loss, **log_params)
             self.log('pt_occ_loss', pt_occ_loss, **log_params)
@@ -553,18 +555,18 @@ class InfGen(pl.LightningModule):
                 # print(f"seed train mask: {next_state_eval_mask_seed[sa].long().tolist()}")
 
         # map token loss
-        if self.predict_map:
+        if self.predict_map and not self.paper_objective:
 
             map_next_token_prob = pred['map_next_token_prob']
             map_next_token_idx_gt = pred['map_next_token_idx_gt']
             map_next_token_eval_mask = pred['map_next_token_eval_mask']
 
-            map_token_loss = self.map_token_loss(map_next_token_prob[map_next_token_eval_mask], map_next_token_idx_gt[map_next_token_eval_mask]) * self.loss_weight['map_token_loss']
+            map_token_loss = masked_loss(self.map_token_loss, map_next_token_prob, map_next_token_idx_gt, map_next_token_eval_mask) * self.loss_weight['map_token_loss']
             self.log('map_token_loss', map_token_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
             loss = loss + map_token_loss
 
-        allocated = torch.cuda.memory_allocated(device='cuda:0') / (1024 ** 3)
-        reserved = torch.cuda.memory_reserved(device='cuda:0') / (1024 ** 3)
+        allocated = torch.cuda.memory_allocated(self.device) / (1024 ** 3) if self.device.type == 'cuda' else 0.0
+        reserved = torch.cuda.memory_reserved(self.device) / (1024 ** 3) if self.device.type == 'cuda' else 0.0
         self.log('allocated', allocated, **log_params)
         self.log('reserved', reserved, **log_params)
 
@@ -641,7 +643,7 @@ class InfGen(pl.LightningModule):
                 next_token_prob = pred['next_token_prob']
                 next_token_eval_mask = pred['next_token_eval_mask']
 
-                token_cls_loss = self.token_cls_loss(next_token_prob[next_token_eval_mask], next_token_idx_gt[next_token_eval_mask])
+                token_cls_loss = masked_loss(self.token_cls_loss, next_token_prob, next_token_idx_gt, next_token_eval_mask)
                 loss = loss + token_cls_loss
 
             if self.predict_state:
@@ -652,7 +654,7 @@ class InfGen(pl.LightningModule):
                 next_state_prob = pred['next_state_prob']
                 next_state_eval_mask = pred['next_state_eval_mask']
 
-                state_cls_loss = self.state_cls_loss(next_state_prob[next_state_eval_mask], next_state_idx_gt[next_state_eval_mask])
+                state_cls_loss = masked_loss(self.state_cls_loss, next_state_prob, next_state_idx_gt, next_state_eval_mask)
                 loss = loss + state_cls_loss
 
                 # seed state token
@@ -703,7 +705,7 @@ class InfGen(pl.LightningModule):
             rollouts = []
             for _ in tqdm(range(self.n_rollout_close_val), leave=False, desc='Rollout ...'):
                 rollout = self.encoder.inference(data.clone())
-            rollouts.append(rollout)
+                rollouts.append(rollout)
 
             av_index = int(rollout['ego_index'])
             scenario_id = rollout['scenario_id'][0]
@@ -804,6 +806,9 @@ class InfGen(pl.LightningModule):
                     pred_state.append(rollout['next_state_idx'])
                     agent_id.append(rollout['agent_id'])
 
+                if len({tuple(ids.tolist()) for ids in agent_id}) > 1:
+                    raise ValueError("Rollout export requires identical agent IDs across rollouts; use n_rollout_close_val=1 with dynamic insertion")
+
                 pred_valid = torch.stack(pred_valid, dim=1)
                 token_pos = torch.stack(token_pos, dim=1)
                 token_head = torch.stack(token_head, dim=1)
@@ -831,7 +836,7 @@ class InfGen(pl.LightningModule):
                     pred_valid=pred_valid.cpu(),
                     token_pos=token_pos.cpu(),
                     token_head=token_head.cpu(),
-                    tfrecord_path=data['tfrecord_path'],
+                    tfrecord_path=data.get('tfrecord_path'),
                 )
 
                 if self._save_validate_reuslts:
@@ -874,7 +879,7 @@ class InfGen(pl.LightningModule):
         return [optimizer], [lr_scheduler]
 
     def load_state_from_file(self, filename, to_cpu=False):
-        logger = self.local_logger
+        logger = self.local_logger or logging.getLogger(__name__)
 
         if not os.path.isfile(filename):
             raise FileNotFoundError
@@ -903,6 +908,9 @@ class InfGen(pl.LightningModule):
                     print(f'Ignore key in disk (shape does not match): {key}, load_shape={val.shape}, model_shape={model_state[key].shape}')
 
         model_state_disk = model_state_disk_filter
+        matched_parameters = set(dict(self.named_parameters())).intersection(model_state_disk)
+        if not matched_parameters:
+            raise ValueError(f"Checkpoint {filename!s} contains no matching trainable parameters; refusing a no-op pretrain load")
         missing_keys, unexpected_keys = self.load_state_dict(model_state_disk, strict=False)
 
         logger.info(f'Missing keys: {missing_keys}')
@@ -936,7 +944,7 @@ class InfGen(pl.LightningModule):
         distance = torch.sum((token_sample_pt[None] - traj_pos_local.unsqueeze(1)) ** 2, dim=(-2, -1))
         pt_token_id = torch.argmin(distance, dim=1)
 
-        if self.noise:
+        if self.noise and (self.training or not self.paper_objective):
             topk_indices = torch.argsort(torch.sum((token_sample_pt[None] - traj_pos_local.unsqueeze(1))**2, dim=(-2, -1)), dim=1)[:, :8]
             sample_topk = torch.randint(0, topk_indices.shape[-1], size=(topk_indices.shape[0], 1), device=topk_indices.device)
             pt_token_id = torch.gather(topk_indices, 1, sample_topk).squeeze(-1)
@@ -952,6 +960,10 @@ class InfGen(pl.LightningModule):
         # token_src_world_select = token_src_world.view(-1, 1024, 11, 2)[torch.arange(pt_token_id.view(-1).shape[0]), pt_token_id.view(-1)].view(pl_num, max_traj_len, 2)
 
         pl_idx_full = pl_idx_list.clone()
+        if isinstance(data, Batch):
+            # map_save.pl_idx_list contains local polygon IDs; PyG does not
+            # increment this custom field when concatenating scenarios.
+            pl_idx_full += data['map_polygon']['ptr'][:-1][data['pt_token']['batch']]
         token2pl = torch.stack([torch.arange(len(pl_idx_list), device=traj_pos.device), pl_idx_full.long()])
         count_nums = []
         for pl in pl_idx_full.unique():
@@ -1054,10 +1066,13 @@ class InfGen(pl.LightningModule):
 
                 pos_xy[~is_invalid_t & is_inrange_t, t] = agent_token_pos[~is_invalid_t & is_inrange_t, t] - ego_pos[[t]]
 
-                # distance = ((agent_token_pos[:, t] - ego_pos[[t]]) ** 2).sum(-1).sqrt()
-                head_vector = torch.stack([ego_heading[[t]].cos(), ego_heading[[t]].sin()], dim=-1)
-                distance = angle_between_2d_vectors(ctr_vector=head_vector,
-                                                    nbr_vector=agent_token_pos[:, t] - ego_pos[[t]])
+                if self.paper_objective:
+                    # Sec.4.4 orders insertions from near to far around the ego.
+                    distance = torch.linalg.vector_norm(agent_token_pos[:, t] - ego_pos[[t]], dim=-1)
+                else:
+                    head_vector = torch.stack([ego_heading[[t]].cos(), ego_heading[[t]].sin()], dim=-1)
+                    distance = angle_between_2d_vectors(ctr_vector=head_vector,
+                                                        nbr_vector=agent_token_pos[:, t] - ego_pos[[t]])
                 # distance = torch.rand(agent_token_pos.shape[0], device=agent_token_pos.device)
                 distance[~(is_bos_t & is_inrange_t)] = torch.inf
                 sort_dist, sort_indice = distance.sort()

@@ -16,7 +16,6 @@ import multiprocessing
 import os
 import numpy as np
 import pandas as pd
-import tensorflow as tf
 import torch
 import pickle
 import easydict
@@ -25,7 +24,6 @@ from scipy.interpolate import interp1d
 from argparse import ArgumentParser
 from tqdm import tqdm
 from typing import Any, Dict, List, Optional
-from waymo_open_dataset.protos import scenario_pb2
 
 
 MIN_VALID_STEPS = 15
@@ -148,21 +146,26 @@ def safe_list_index(ls: List[Any], elem: Any) -> Optional[int]:
 #     }
 
 
-def get_agent_features(track_infos: Dict[str, np.ndarray], av_id: int, num_historical_steps: int, num_steps: int) -> Dict[str, Any]:
+def get_agent_features(track_infos: Dict[str, np.ndarray], av_id: int,
+                       num_historical_steps: int, num_steps: int,
+                       split: str = 'training', disable_invalid: bool = False) -> Dict[str, Any]:
 
     agent_idx_to_add = []
     for i in range(len(track_infos['object_id'])):
+        valid_steps = np.flatnonzero(track_infos['valid'][i])
+        if not len(valid_steps) or int(track_infos['object_type'][i]) not in (0, 1, 2):
+            continue  # The paper models vehicles, pedestrians and cyclists only.
         is_visible = track_infos['valid'][i, num_historical_steps - 1]
 
-        if split == 'testing':
-            assert args.disable_invalid, f'Need to disable invalid for testing!'
+        if split in ('test', 'testing'):
+            assert disable_invalid, f'Need to disable invalid for testing!'
             is_valid = True
         else:
             valid_steps = np.where(track_infos['valid'][i])[0]
             valid_start, valid_end = valid_steps[0], valid_steps[-1]
             is_valid = (valid_end - valid_start + 1) >= MIN_VALID_STEPS
 
-        if (is_visible or not args.disable_invalid) and is_valid:
+        if (is_visible or not disable_invalid) and is_valid:
             agent_idx_to_add.append(i)
 
     num_agents = len(agent_idx_to_add)
@@ -190,7 +193,12 @@ def get_agent_features(track_infos: Dict[str, np.ndarray], av_id: int, num_histo
         states = track_infos["states"][idx]
 
         object_shape = states[:, 3:6]  # [n_step, 3], length, width, height
-        object_shape = object_shape[valid].mean(axis=0)  # [3]
+        historical_shape_valid = valid.copy()
+        historical_shape_valid[num_historical_steps:] = False
+        # Rigid attributes of visible seeds must not be estimated from future
+        # annotations. Future-only agents retain full-track target attributes.
+        shape_observations = historical_shape_valid if historical_shape_valid.any() else valid
+        object_shape = object_shape[shape_observations].mean(axis=0)  # [3]
         out_dict["shape"][i] = torch.from_numpy(object_shape)
 
         valid_steps = np.where(valid)[0]
@@ -198,7 +206,7 @@ def get_agent_features(track_infos: Dict[str, np.ndarray], av_id: int, num_histo
         velocity = states[:, 7:9]  # [n_step, 2], vx, vy
         heading = states[:, 6]  # [n_step], heading
 
-        if split == 'testing':
+        if split in ('test', 'testing'):
 
             out_dict['valid_mask'][i, valid_steps] = True
             out_dict['position'][i, valid_steps] = torch.from_numpy(position[valid_steps])
@@ -395,7 +403,7 @@ def get_map_features(map_infos, tf_current_light, dim=3):
     map_data['map_polygon']['light_type'] = polygon_light_type # (num_polygons,) light type of each polygon, 3 means unknown
     if len(num_points) == 0:
         map_data['map_point']['num_nodes'] = 0
-        map_data['map_point']['position'] = torch.tensor([], dtype=torch.float)
+        map_data['map_point']['position'] = torch.empty((0, dim), dtype=torch.float)
         map_data['map_point']['orientation'] = torch.tensor([], dtype=torch.float)
         map_data['map_point']['magnitude'] = torch.tensor([], dtype=torch.float)
         if dim == 3:
@@ -414,7 +422,7 @@ def get_map_features(map_infos, tf_current_light, dim=3):
     map_data['map_polygon', 'to', 'map_polygon']['edge_index'] = polygon_to_polygon_edge_index
     map_data['map_polygon', 'to', 'map_polygon']['type'] = polygon_to_polygon_type
 
-    if int(os.getenv('DEBUG_MAP', 1)):
+    if int(os.getenv('DEBUG_MAP', 0)):
         import matplotlib.pyplot as plt
         plt.axis('equal')
         plt.scatter(map_data['map_point']['position'][:, 0],
@@ -492,9 +500,13 @@ def process_dynamic_map(dynamic_map_infos):
         state = dynamic_map_infos["state"][t]
         tf_light = np.concatenate([lane_id, time, state], axis=0)
         tf_lights.append(tf_light)
+    if not tf_lights:
+        return pd.DataFrame({'lane_id': pd.Series(dtype=str),
+                             'time_step': pd.Series(dtype=int),
+                             'state': pd.Series(dtype=str)})
     tf_lights = np.concatenate(tf_lights, axis=1).transpose(1, 0)
     tf_lights = pd.DataFrame(data=tf_lights, columns=["lane_id", "time_step", "state"])
-    tf_lights["time_step"] = tf_lights["time_step"].astype("str")
+    tf_lights["time_step"] = tf_lights["time_step"].astype(int)
     tf_lights["lane_id"] = tf_lights["lane_id"].astype("str")
     tf_lights["state"] = tf_lights["state"].astype("str")
     tf_lights.loc[tf_lights["state"].str.contains("STOP"), ["state"]] = (
@@ -607,7 +619,7 @@ def decode_tracks_from_proto(scenario):
     track_infos['valid']    = np.array(track_infos['valid'], dtype=np.bool_)
     track_infos['role']     = np.array(track_infos['role'], dtype=np.bool_)
     track_infos['object_id'] = np.array(track_infos['object_id'], dtype=np.int64)
-    track_infos['object_type'] = np.array(track_infos['object_type'], dtype=np.uint8)
+    track_infos['object_type'] = np.array(track_infos['object_type'], dtype=np.int64)
     track_infos['tracks_to_predict'] = np.array(track_index_predict, dtype=np.int64)
 
     return track_infos
@@ -727,7 +739,8 @@ def decode_map_features_from_proto(map_features):
         cur_info['polyline_index'] = (point_cnt, point_cnt + len(cur_polyline)) # (start index of point in current scenario, end index of point in current scenario)
         point_cnt += len(cur_polyline)
 
-    polylines = np.concatenate(polylines, axis=0).astype(np.float32)
+    polylines = (np.concatenate(polylines, axis=0).astype(np.float32)
+                 if polylines else np.empty((0, 5), dtype=np.float32))
     map_infos['all_polylines'] = polylines # (num_of_total_points_in_current_scenario, 5)
     map_infos['lane2other_dict'] = lane2other_dict
     return map_infos
@@ -799,7 +812,13 @@ def decode_dynamic_map_states_from_proto(dynamic_map_states):
 #     return save_infos
 
 
-def wm2argo(file, input_dir, output_dir, existing_files=[], output_dir_tfrecords_splitted=None):
+def wm2argo(file, input_dir, output_dir, existing_files=None,
+            output_dir_tfrecords_splitted=None, split='training', disable_invalid=False):
+    # TFRecord decoding alone needs these optional, platform-specific packages.
+    import tensorflow as tf
+    from waymo_open_dataset.protos import scenario_pb2
+
+    existing_files = set(existing_files or ())
     file_path = os.path.join(input_dir, file)
     dataset = tf.data.TFRecordDataset(file_path, compression_type='', num_parallel_reads=3)
 
@@ -829,10 +848,16 @@ def wm2argo(file, input_dir, output_dir, existing_files=[], output_dir_tfrecords
             data = dict()
             data.update(map_data)
             data['scenario_id'] = scenario_id
-            data['agent'] = get_agent_features(track_infos, av_id, num_historical_steps=current_time_index + 1, num_steps=91)
+            data['agent'] = get_agent_features(
+                track_infos, av_id, num_historical_steps=current_time_index + 1,
+                num_steps=len(scenario.timestamps_seconds), split=split,
+                disable_invalid=disable_invalid)
 
-            with open(os.path.join(output_dir, f'{scenario_id}.pkl'), "wb+") as f:
+            final_path = os.path.join(output_dir, f'{scenario_id}.pkl')
+            temporary_path = final_path + f'.{os.getpid()}.tmp'
+            with open(temporary_path, 'wb') as f:
                 pickle.dump(data, f)
+            os.replace(temporary_path, final_path)
 
         if output_dir_tfrecords_splitted is not None:
             tf_file = os.path.join(output_dir_tfrecords_splitted, f'{scenario_id}.tfrecords')
@@ -841,8 +866,14 @@ def wm2argo(file, input_dir, output_dir, existing_files=[], output_dir_tfrecords
                     file_writer.write(tf_data.numpy())
 
 
-def batch_process9s_transformer(input_dir, output_dir, num_workers=2):
+def _ignore_worker_sigint():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def batch_process9s_transformer(input_dir, output_dir, num_workers=2,
+                              split='training', disable_invalid=False):
+    if num_workers < 1:
+        raise ValueError('num_workers must be at least 1')
 
     output_dir_tfrecords_splitted = None
     if split == "validation":
@@ -853,17 +884,20 @@ def batch_process9s_transformer(input_dir, output_dir, num_workers=2):
     output_dir = os.path.join(output_dir, split)
     os.makedirs(output_dir, exist_ok=True)
 
-    packages = sorted(os.listdir(input_dir))
+    packages = sorted(name for name in os.listdir(input_dir)
+                      if os.path.isfile(os.path.join(input_dir, name)))
     existing_files = sorted(os.listdir(output_dir))
     func = partial(
         wm2argo,
         output_dir=output_dir,
         input_dir=input_dir,
         existing_files=existing_files,
-        output_dir_tfrecords_splitted=output_dir_tfrecords_splitted
+        output_dir_tfrecords_splitted=output_dir_tfrecords_splitted,
+        split=split,
+        disable_invalid=disable_invalid,
     )
     try:
-        with multiprocessing.Pool(num_workers, maxtasksperchild=10) as p:
+        with multiprocessing.Pool(num_workers, maxtasksperchild=10, initializer=_ignore_worker_sigint) as p:
             r = list(tqdm(p.imap_unordered(func, packages), total=len(packages)))
     except KeyboardInterrupt:
         p.terminate()
@@ -875,13 +909,15 @@ def generate_meta_infos(data_dir):
 
     meta_infos = dict()
 
-    for split in tqdm(['training', 'validation', 'test'], leave=False):
+    for split in tqdm(['training', 'validation', 'testing', 'test'], leave=False):
         if not os.path.exists(os.path.join(data_dir, split)):
             continue
 
         split_infos = dict()
         files = os.listdir(os.path.join(data_dir, split))
         for file in tqdm(files, leave=False):
+            if not file.endswith('.pkl'):
+                continue
             try:
                 data = pickle.load(open(os.path.join(data_dir, split, file), 'rb'))
             except Exception as e:
@@ -897,17 +933,19 @@ def generate_meta_infos(data_dir):
         json.dump(meta_infos, f, indent=4)
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = ArgumentParser()
     parser.add_argument('--input_dir', type=str, default='data/waymo/')
     parser.add_argument('--output_dir', type=str, default='data/waymo_processed/')
-    parser.add_argument('--split', type=str, default='validation')
+    parser.add_argument('--split', choices=['training', 'validation', 'testing', 'test'], default='validation')
+    parser.add_argument('--num_workers', type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument('--no_batch', action='store_true')
     parser.add_argument('--disable_invalid', action="store_true")
     parser.add_argument('--generate_meta_infos', action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    split = args.split
+    if args.split in ('test', 'testing') and not args.disable_invalid and not args.generate_meta_infos:
+        parser.error('WOMD testing requires --disable_invalid because future states are withheld')
 
     if args.generate_meta_infos:
         generate_meta_infos(args.output_dir)
@@ -926,8 +964,19 @@ if __name__ == "__main__":
         files = sorted(os.listdir(input_dir))
         os.makedirs(args.output_dir, exist_ok=True)
         for file in tqdm(files, leave=False, desc=f'Process {args.split}...'):
-            wm2argo(file, input_dir, output_dir, output_dir_tfrecords_splitted)
+            if not os.path.isfile(os.path.join(input_dir, file)):
+                continue
+            wm2argo(file, input_dir, output_dir,
+                    existing_files=os.listdir(output_dir),
+                    output_dir_tfrecords_splitted=output_dir_tfrecords_splitted,
+                    split=args.split, disable_invalid=args.disable_invalid)
 
     else:
 
-        batch_process9s_transformer(args.input_dir, args.output_dir, num_workers=96)
+        batch_process9s_transformer(args.input_dir, args.output_dir,
+                                   num_workers=args.num_workers, split=args.split,
+                                   disable_invalid=args.disable_invalid)
+
+
+if __name__ == '__main__':
+    main()

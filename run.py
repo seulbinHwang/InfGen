@@ -1,182 +1,135 @@
-import pytorch_lightning as pl
-import os
-import shutil
-import fnmatch
-import torch
+"""Train or evaluate the official InfGen model with explicit, portable options."""
 from argparse import ArgumentParser
-from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning.loggers import WandbLogger
+from pathlib import Path
+import json
+import logging
 
-from infgen.utils.func import RankedLogger, load_config_act, CONSOLE
-from infgen.datasets.scalable_dataset import MultiDataModule
-from infgen.model.infgen import InfGen
+REPO = Path(__file__).resolve().parent
 
 
-def backup(source_dir, backup_dir):
-    """
-    Back up the source directory (code and configs) to a backup directory.
-    """
-
-    if os.path.exists(backup_dir):
-        return
-    os.makedirs(backup_dir, exist_ok=False)
-
-    # Helper function to check if a path matches exclude patterns
-    def should_exclude(path):
-        for pattern in exclude_patterns:
-            if fnmatch.fnmatch(os.path.basename(path), pattern):
-                return True
-        return False
-
-    # Iterate through the files and directories in source_dir
-    for root, dirs, files in os.walk(source_dir):
-        # Skip excluded directories
-        dirs[:] = [d for d in dirs if not should_exclude(d)]
-
-        # Determine the relative path and destination path
-        rel_path = os.path.relpath(root, source_dir)
-        dest_dir = os.path.join(backup_dir, rel_path)
-        os.makedirs(dest_dir, exist_ok=True)
-        
-        # Copy all relevant files
-        for file in files:
-            if any(fnmatch.fnmatch(file, pattern) for pattern in include_patterns):
-                shutil.copy2(os.path.join(root, file), os.path.join(dest_dir, file))
-    
-    logger.info(f"Backup completed. Files saved to: {backup_dir}")
+def build_parser(default_action=None):
+    parser = ArgumentParser(description=__doc__)
+    actions = parser.add_mutually_exclusive_group(required=default_action is None)
+    for action in ("train", "validate", "test", "plot_rollouts"):
+        actions.add_argument(f"--{action}", action="store_true")
+    parser.set_defaults(default_action=default_action)
+    parser.add_argument("--config", default=str(REPO / "configs/paper_reproduction.yaml"))
+    parser.add_argument("--data_root", help="Processed data root containing training/ and validation/.")
+    parser.add_argument("--ckpt_path", help="Resume all training states, or load a model for evaluation.")
+    parser.add_argument("--pretrain_ckpt", help="Explicit partial parameter initialization (not a resume).")
+    parser.add_argument("--save_ckpt_path", default="output/infgen")
+    parser.add_argument("--save_path", default=None)
+    parser.add_argument("--accelerator", choices=("cpu", "gpu", "auto"))
+    parser.add_argument("--devices", type=int)
+    parser.add_argument("--num_workers", type=int)
+    parser.add_argument("--batch_size", type=int, help="Per-device training batch size.")
+    parser.add_argument("--max_epochs", type=int)
+    parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--limit_train_batches", type=int)
+    parser.add_argument("--limit_val_batches", type=int)
+    parser.add_argument("--seed", type=int, default=2024)
+    parser.add_argument("--scenario_id")
+    parser.add_argument("--wandb", action="store_true", help="Explicitly enable optional remote logging.")
+    return parser
 
 
-if __name__ == '__main__':
-    pl.seed_everything(2024, workers=True)
-    torch.set_printoptions(precision=3)
+def main(argv=None, default_action=None):
+    parser = build_parser(default_action)
+    args = parser.parse_args(argv)
+    action = next((name for name in ("train", "validate", "test", "plot_rollouts")
+                   if getattr(args, name)), args.default_action)
+    if args.ckpt_path and not Path(args.ckpt_path).is_file():
+        parser.error(f"Checkpoint does not exist: {args.ckpt_path}")
+    if action != "train" and not args.ckpt_path:
+        parser.error("Evaluation requires --ckpt_path; use infer.py for rollout export.")
+    if args.pretrain_ckpt and args.ckpt_path:
+        parser.error("Choose partial initialization or full resume, not both.")
 
-    parser = ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/ours_long_term.yaml')
-    parser.add_argument('--pretrain_ckpt', type=str, default=None,
-                        help='Path to any pretrained model, will only load its parameters.'
-    )
-    parser.add_argument('--ckpt_path', type=str, default=None,
-                        help='Path to any trained model, will load all the states.'
-    )
-    parser.add_argument('--save_ckpt_path', type=str, default='output/debug',
-                        help='Path to save the checkpoints in training mode'
-    )
-    parser.add_argument('--save_path', type=str, default=None,
-                        help='Path to save the inference results in validation and test mode.'
-    )
-    parser.add_argument('--wandb', action='store_true',
-                        help='Whether to use wandb logger in training.'
-    )
-    parser.add_argument('--devices', type=int, default=1)
-    parser.add_argument('--train', action='store_true')
-    parser.add_argument('--validate', action='store_true')
-    parser.add_argument('--test', action='store_true')
-    parser.add_argument('--plot_rollouts', action='store_true')
-    parser.add_argument('--scenario_id', type=str, default=None)
-    args = parser.parse_args()
+    import pytorch_lightning as pl
+    import torch
+    import yaml
+    from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+    from pytorch_lightning.loggers import CSVLogger, WandbLogger
+    from pytorch_lightning.strategies import DDPStrategy
+    from infgen.datasets.scalable_dataset import MultiDataModule
+    from infgen.model.infgen import InfGen
+    from infgen.utils.func import load_config_act
 
-    if not (args.train or args.validate or args.test or args.plot_rollouts):
-        raise RuntimeError(f"Got invalid action, should be one of ['train', 'validate', 'test', 'plot_rollouts']")
-
-    # ! setup logger
-    logger = RankedLogger(__name__, rank_zero_only=True)
-
-    # ! backup codes
-    exclude_patterns = ['*output*', '*logs', 'wandb', 'data', '*debug*', '*backup*', 'interact_*', '*edge_map*', '__pycache__']
-    include_patterns = ['*.py', '*.json', '*.yaml', '*.yml', '*.sh']
-    backup(os.getcwd(), os.path.join(args.save_ckpt_path, 'backups'))
-
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("infgen")
+    pl.seed_everything(args.seed, workers=True)
     config = load_config_act(args.config)
-
-    wandb_logger = None
-    if args.wandb and not int(os.getenv('DEBUG', 0)):
-        # squeue -O username,state,nodelist,gres,minmemory,numcpus,name
-        wandb_logger = WandbLogger(project='simagent')
-
-    trainer_config = config.Trainer
-    max_epochs = trainer_config.max_epochs
-
-    # ! setup datamodule and model
-    datamodule = MultiDataModule(**vars(config.Dataset), logger=logger, scenario_id=args.scenario_id)
-    model = InfGen(config.Model, save_path=args.save_ckpt_path, logger=logger, max_epochs=max_epochs)
+    if args.data_root:
+        data_root = Path(args.data_root).expanduser().resolve()
+        config.Dataset.train_raw_dir = str(data_root / "training")
+        config.Dataset.val_raw_dir = str(data_root / "validation")
+        config.Dataset.test_raw_dir = str(data_root / "validation")
+        config.Dataset.val_tfrecords_splitted = None
+    for key in ("train_raw_dir", "val_raw_dir", "test_raw_dir", "val_tfrecords_splitted"):
+        value = config.Dataset.get(key)
+        if value:
+            values = value if isinstance(value, list) else [value]
+            resolved = [str((REPO / Path(v).expanduser()).resolve()) for v in values]
+            config.Dataset[key] = resolved if isinstance(value, list) else resolved[0]
+    if args.num_workers is not None:
+        if args.num_workers < 0:
+            parser.error("--num_workers must be nonnegative")
+        config.Dataset.num_workers = args.num_workers
+    if args.batch_size is not None:
+        if args.batch_size < 1:
+            parser.error("--batch_size must be positive")
+        config.Dataset.train_batch_size = args.batch_size
+    for key in ("accelerator", "devices", "max_epochs"):
+        value = getattr(args, key)
+        if value is not None:
+            config.Trainer[key] = value
+    if config.Trainer.devices < 1 or config.Trainer.max_epochs < 1:
+        parser.error("devices and max_epochs must be positive")
+    if config.Trainer.accelerator == "gpu" and not torch.cuda.is_available():
+        parser.error("The GPU recipe requires NVIDIA CUDA; local checks use --accelerator cpu --devices 1")
+    if args.max_epochs is not None:
+        config.Model.total_steps = args.max_epochs
+    if action != "train" and config.Dataset.val_batch_size != 1:
+        parser.error("Released closed-loop inference supports one scenario per batch.")
+    if config.Trainer.accelerator == "cpu":
+        config.Dataset.pin_memory = False
+    output = Path(args.save_ckpt_path).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / "resolved_config.yaml").open("w") as stream:
+        yaml.safe_dump(json.loads(json.dumps(config)), stream, sort_keys=False)
+    run_logger = WandbLogger(project="infgen") if args.wandb else CSVLogger(str(output), name="logs")
+    strategy = (DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True)
+                if config.Trainer.devices * config.Trainer.num_nodes > 1 else "auto")
+    model = InfGen(config.Model, save_path=str(output), logger=logger,
+                   max_epochs=config.Trainer.max_epochs)
     if args.pretrain_ckpt:
-        model.load_state_from_file(filename=args.pretrain_ckpt)
-    strategy = DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True)
-    logger.info(f'Build model: {model.__class__.__name__} datamodule: {datamodule.__class__.__name__}')
-
-    # ! checkpoint configuration
-    every_n_epochs = 1
-    if int(os.getenv('OVERFIT', 0)):
-        max_epochs = trainer_config.overfit_epochs
-        every_n_epochs = 100
-
-    if int(os.getenv('CHECK_INPUTS', 0)):
-        max_epochs = 1
-
-    check_val_every_n_epoch = 1  # save checkpoints for each epoch
-    model_checkpoint = ModelCheckpoint(dirpath=args.save_ckpt_path,
-                                       filename='{epoch:02d}',
-                                       save_top_k=5,
-                                       monitor='epoch',
-                                       mode='max',
-                                       save_last=True,
-                                       every_n_train_steps=1000,
-                                       save_on_train_epoch_end=True)
-
-    # ! setup trainer
-    lr_monitor = LearningRateMonitor(logging_interval='epoch')
-    trainer = pl.Trainer(accelerator=trainer_config.accelerator, devices=args.devices if args.devices is not None else trainer_config.devices,
-                         strategy=strategy, logger=wandb_logger,
-                         accumulate_grad_batches=trainer_config.accumulate_grad_batches,
-                         num_nodes=trainer_config.num_nodes,
-                         callbacks=[model_checkpoint, lr_monitor],
-                         max_epochs=max_epochs,
-                         num_sanity_val_steps=0,
-                         check_val_every_n_epoch=check_val_every_n_epoch,
-                         log_every_n_steps=1,
-                         gradient_clip_val=0.5)
-    logger.info(f'Build trainer: {trainer.__class__.__name__}')
-
-    # ! run
-    if args.train:
-
-        logger.info(f'Start training ...')
-        trainer.fit(model, datamodule, ckpt_path=args.ckpt_path)
-
-    # NOTE: here both validation and test process use validation split data
-    # for validation, we enable the online metric calculation with results dumping
-    # for test, we disable it and only dump the inference results.
+        model.load_state_from_file(args.pretrain_ckpt, to_cpu=True)
+    datamodule = MultiDataModule(**config.Dataset, logger=logger, scenario_id=args.scenario_id)
+    checkpoint = ModelCheckpoint(dirpath=str(output), filename="epoch-{epoch:02d}",
+                                 save_last=True, save_top_k=-1, save_on_train_epoch_end=True)
+    trainer_kwargs = dict(
+        accelerator=config.Trainer.accelerator, devices=config.Trainer.devices,
+        strategy=strategy, num_nodes=config.Trainer.num_nodes,
+        max_epochs=config.Trainer.max_epochs, max_steps=args.max_steps,
+        accumulate_grad_batches=config.Trainer.accumulate_grad_batches,
+        precision=config.Trainer.precision,
+        callbacks=[checkpoint, LearningRateMonitor(logging_interval="epoch")],
+        logger=run_logger, num_sanity_val_steps=0, log_every_n_steps=1,
+        gradient_clip_val=0.5,
+    )
+    if args.limit_train_batches is not None:
+        trainer_kwargs["limit_train_batches"] = args.limit_train_batches
+    if args.limit_val_batches is not None:
+        trainer_kwargs["limit_val_batches"] = args.limit_val_batches
+    trainer = pl.Trainer(**trainer_kwargs)
+    if action == "train":
+        trainer.fit(model, datamodule=datamodule, ckpt_path=args.ckpt_path)
     else:
+        model.save_path = str(Path(args.save_path or output / "rollouts").resolve())
+        Path(model.save_path).mkdir(parents=True, exist_ok=True)
+        model.set({"validate": "validation", "test": "test", "plot_rollouts": "plot_rollouts"}[action])
+        trainer.validate(model, datamodule=datamodule, ckpt_path=args.ckpt_path)
 
-        if args.save_path is not None:
-            save_path = args.save_path
-        else:
-            assert args.ckpt_path is not None and os.path.exists(args.ckpt_path), \
-                    f'Path {args.ckpt_path} not exists!'
-            save_path = os.path.join(os.path.dirname(args.ckpt_path), 'validation')
-        os.makedirs(save_path, exist_ok=True)
-        CONSOLE.log(f'Results will be saved to [yellow]{save_path}[/]')
 
-        model.save_path = save_path
-
-        if not args.ckpt_path:
-            CONSOLE.log(f'[yellow] Warning: no checkpoint will be loaded in validation! [/]')
-
-        if args.validate:
-
-            CONSOLE.log('[on blue] Start validating ... [/]')
-            model.set(mode='validation')
-
-        elif args.test:
-
-            CONSOLE.log('[on blue] Sart testing ... [/]')
-            model.set(mode='test')
-
-        elif args.plot_rollouts:
-
-            CONSOLE.log('[on blue] Sart generating ... [/]')
-            model.set(mode='plot_rollouts')
-
-        trainer.validate(model, datamodule, ckpt_path=args.ckpt_path)
+if __name__ == "__main__":
+    main()

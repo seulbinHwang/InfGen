@@ -7,12 +7,13 @@ from infgen.utils.func import wrap_angle, angle_between_2d_vectors
 
 class Attr_Tokenizer(nn.Module):
 
-    def __init__(self, grid_range, grid_interval, radius, angle_interval):
+    def __init__(self, grid_range, grid_interval, radius, angle_interval, nearest_heading=False):
         super().__init__()
         self.grid_range = grid_range
         self.grid_interval = grid_interval
         self.radius = radius
         self.angle_interval = angle_interval
+        self.nearest_heading = nearest_heading
         self.heading = torch.pi / 2
         self._prepare_grid()
 
@@ -46,13 +47,10 @@ class Attr_Tokenizer(nn.Module):
         # x: (b, l, 2) e.g. (num_step, num_agent, 2)
         # theta: (b,) e.g. (num_step,)
         cos, sin = theta.cos(), theta.sin()
-        rot_mat = torch.zeros((theta.shape[0], 2, 2), device=theta.device)
-        rot_mat[:, 0, 0] = cos
-        rot_mat[:, 0, 1] = sin
-        rot_mat[:, 1, 0] = -sin
-        rot_mat[:, 1, 1] = cos
-        x = torch.bmm(x, rot_mat)
-        return x
+        rot_mat = torch.stack((cos, sin, -sin, cos), dim=-1).reshape(-1, 2, 2)
+        # Broadcast a shared grid over all query headings as well as rotating
+        # one point batch per query. bmm cannot broadcast the shared grid.
+        return torch.matmul(x, rot_mat.to(dtype=x.dtype))
 
     def pad_square(self, prob, indices=None):
         # square_mask: bool array of shape (n^2,)
@@ -83,7 +81,7 @@ class Attr_Tokenizer(nn.Module):
         distance = ((centered_x[:, None] - self.grid.to(x.device)[None, ...]) ** 2).sum(-1).sqrt()
         index = torch.argmin(distance, dim=-1)
 
-        grid_xy = self.grid[index]
+        grid_xy = self.grid.to(x.device)[index]
         offset_xy = centered_x - grid_xy
 
         return index.long(), offset_xy
@@ -100,8 +98,9 @@ class Attr_Tokenizer(nn.Module):
 
     def encode_heading(self, heading):
         heading = (wrap_angle(heading) + torch.pi) / (2 * torch.pi) * 360
-        index = heading // self.angle_interval
-        return index.long()
+        index = torch.round(heading / self.angle_interval) if self.nearest_heading else heading // self.angle_interval
+        # Floating point rounding near +pi can otherwise yield angle_size.
+        return index.long().remainder(self.angle_size)
 
     def decode_heading(self, index):
         assert torch.all(index >= 0) and torch.all(index < (360 / self.angle_interval))

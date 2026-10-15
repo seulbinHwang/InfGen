@@ -3,7 +3,6 @@ import os
 import torch
 import pickle
 import matplotlib.pyplot as plt
-import tensorflow as tf
 import numpy as np
 import numpy.typing as npt
 import fnmatch
@@ -17,11 +16,10 @@ from typing import Sequence, Union, Optional
 from tqdm import tqdm
 from typing import List, Literal
 from argparse import ArgumentParser
-from scipy.ndimage.filters import gaussian_filter
+from scipy.ndimage import gaussian_filter
 from matplotlib.patches import FancyBboxPatch, Polygon, Rectangle, Circle
 from matplotlib.collections import LineCollection
 from torch_geometric.data import HeteroData, Dataset
-from waymo_open_dataset.protos import scenario_pb2
 
 from infgen.utils.func import CONSOLE
 from infgen.modules.attr_tokenizer import Attr_Tokenizer
@@ -433,6 +431,10 @@ def plot_prob_seed(scenario_id, prob, save_path, prefix='', indices=None):
 
 @safe_run
 def plot_raw():
+    # Raw TFRecords are optional; processed-data training and rollout need no TF.
+    import tensorflow as tf
+    from waymo_open_dataset.protos import scenario_pb2
+
     plt.figure(figsize=(30, 30))
     plt.rcParams['axes.facecolor']='white'
 

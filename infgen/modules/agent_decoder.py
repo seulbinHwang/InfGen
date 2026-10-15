@@ -5,13 +5,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from typing import Dict, Mapping, Optional, Literal
-from torch_cluster import radius, radius_graph
 from torch_geometric.data import HeteroData, Batch
 from torch_geometric.utils import dense_to_sparse, subgraph
 from scipy.optimize import linear_sum_assignment
 
 from infgen.modules.attr_tokenizer import Attr_Tokenizer
 from infgen.modules.layers import *
+from infgen.modules.layers import batched_radius as radius, batched_radius_graph as radius_graph
 from infgen.utils.visualization import *
 from infgen.datasets.preprocess import AGENT_SHAPE, AGENT_TYPE
 from infgen.utils.func import angle_between_2d_vectors, wrap_angle, weight_init
@@ -128,6 +128,7 @@ class InfGenAgentDecoder(nn.Module):
                  buffer_size: int=32,
                  num_recurrent_steps_val: int=-1,
                  loss_weight: dict=None,
+                 paper_objective: bool=False,
                  logger=None) -> None:
 
         super(InfGenAgentDecoder, self).__init__()
@@ -150,6 +151,7 @@ class InfGenAgentDecoder(nn.Module):
         self.predict_state = predict_state
         self.predict_map = predict_map
         self.predict_occ = predict_occ
+        self.paper_objective = paper_objective
         self.use_grid_token = use_grid_token
         self.use_head_token = use_head_token
         self.use_state_token = use_state_token
@@ -217,7 +219,9 @@ class InfGenAgentDecoder(nn.Module):
             num_inputs = 4
         else:
             num_inputs = 3
-        self.fusion_emb = MLPEmbedding(input_dim=self.hidden_dim * num_inputs, hidden_dim=self.hidden_dim)
+        self.fusion_emb = (nn.Linear(self.hidden_dim * num_inputs, self.hidden_dim)
+                           if self.paper_objective else
+                           MLPEmbedding(input_dim=self.hidden_dim * num_inputs, hidden_dim=self.hidden_dim))
 
         self.t_attn_layers = nn.ModuleList(
             [AttentionLayer(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim, dropout=dropout,
@@ -258,8 +262,12 @@ class InfGenAgentDecoder(nn.Module):
                                                 output_dim=len(self.seed_state_type))
         self.seed_type_predict_head = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim,
                                                 output_dim=len(AGENT_TYPE) - 1)
-        self.seed_shape_predict_head = MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim,
-                                                output_dim=3)
+        self.seed_shape_predict_head = (
+            nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                          nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                          nn.Linear(hidden_dim, 3)) if self.paper_objective else
+            MLPLayer(input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=3)
+        )
 
         self.grid_size = self.attr_tokenizer.grid_size
         self.angle_size = self.attr_tokenizer.angle_size
@@ -441,7 +449,7 @@ class InfGenAgentDecoder(nn.Module):
         is_last_valid[:, 0] = False
         motion_vector_a[is_last_valid] = -self.motion_gap
 
-        head_a[state_a == self.invalid_state] == self.invalid_head_value
+        head_a = head_a.masked_fill(state_a == self.invalid_state, self.invalid_head_value)
         head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
 
         return motion_vector_a, head_vector_a
@@ -545,15 +553,16 @@ class InfGenAgentDecoder(nn.Module):
 
         if not self.temporal_attn_to_invalid:
             is_bos = state_a == self.enter_state
-            bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0))
+            bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0, device=state_a.device))
             history_invalid_mask = torch.arange(mask.shape[1]).expand(mask.shape[0], mask.shape[1]).to(mask.device)
             history_invalid_mask = (history_invalid_mask < bos_index[:, None])
             hist_mask[history_invalid_mask] = False
 
         if not self.temporal_attn_seed:
-            hist_mask[-num_graph * self.num_seed_feature:] = False
-            if inference_mask is not None:
-                inference_mask[-num_graph * self.num_seed_feature:] = False
+            # Training appends query placeholders; the inference motion pass
+            # contains only real agents, so its final rows must retain history.
+            if inference_mask is None:
+                hist_mask[-num_graph * self.num_seed_feature:] = False
         else:
             # WARNING: if use temporal attn to seed
             # we need to fix the pos/head of seed!!!
@@ -565,8 +574,9 @@ class InfGenAgentDecoder(nn.Module):
 
         # for those invalid agents won't predict any motion token, we don't attend to them
         is_bos = state_a == self.enter_state
-        is_bos[-num_graph * self.num_seed_feature:] = False
-        bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0))
+        if inference_mask is None:
+            is_bos[-num_graph * self.num_seed_feature:] = False
+        bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0, device=state_a.device))
         motion_predict_start_index = torch.clamp(bos_index - self.time_span / self.shift + 1, min=0)
         motion_predict_mask = torch.arange(hist_mask.shape[1]).expand(hist_mask.shape[0], -1).to(hist_mask.device)
         motion_predict_mask = motion_predict_mask >= motion_predict_start_index[:, None]
@@ -595,7 +605,7 @@ class InfGenAgentDecoder(nn.Module):
         rel_pos_t[is_invalid_t[edge_index_t[0]] & ~is_invalid_t[edge_index_t[1]]] = -self.motion_gap
         rel_pos_t[~is_invalid_t[edge_index_t[0]] & is_invalid_t[edge_index_t[1]]] = self.motion_gap
         rel_head_t[is_invalid_t[edge_index_t[0]] & ~is_invalid_t[edge_index_t[1]]] = -self.heading_gap
-        rel_head_t[~is_invalid_t[edge_index_t[1]] & is_invalid_t[edge_index_t[1]]] = self.heading_gap
+        rel_head_t[~is_invalid_t[edge_index_t[0]] & is_invalid_t[edge_index_t[1]]] = self.heading_gap
 
         rel_pos_t[is_invalid_t[edge_index_t[0]] & is_invalid_t[edge_index_t[1]]] = self.invalid_motion_value
         rel_head_t[is_invalid_t[edge_index_t[0]] & is_invalid_t[edge_index_t[1]]] = self.invalid_head_value
@@ -647,7 +657,7 @@ class InfGenAgentDecoder(nn.Module):
         rel_pos_a2a[is_invalid_s[edge_index_a2a[0]] & ~is_invalid_s[edge_index_a2a[1]]] = -self.motion_gap
         rel_pos_a2a[~is_invalid_s[edge_index_a2a[0]] & is_invalid_s[edge_index_a2a[1]]] = self.motion_gap
         rel_head_a2a[is_invalid_s[edge_index_a2a[0]] & ~is_invalid_s[edge_index_a2a[1]]] = -self.heading_gap
-        rel_head_a2a[~is_invalid_s[edge_index_a2a[1]] & is_invalid_s[edge_index_a2a[1]]] = self.heading_gap
+        rel_head_a2a[~is_invalid_s[edge_index_a2a[0]] & is_invalid_s[edge_index_a2a[1]]] = self.heading_gap
 
         rel_pos_a2a[is_invalid_s[edge_index_a2a[0]] & is_invalid_s[edge_index_a2a[1]]] = self.invalid_motion_value
         rel_head_a2a[is_invalid_s[edge_index_a2a[0]] & is_invalid_s[edge_index_a2a[1]]] = self.invalid_head_value
@@ -666,7 +676,7 @@ class InfGenAgentDecoder(nn.Module):
             mask_a &= mask_av
             edge_index_seed2a, r_seed2a = self._build_a2sa_edge(data, pos_a, head_a, head_vector_a, batch_s,
                                                                 mask_a.clone(), ~pad_mask.clone(), inference_mask=inference_mask,
-                                                                r=self.pl2seed_radius, max_num_neighbors=300,
+                                                                r=self.a2sa_radius if self.paper_objective else self.pl2seed_radius, max_num_neighbors=300,
                                                                 seq_mask=seq_mask, seq_index=seq_index, grid_index_a=grid_index_a, mode='insert')
 
             if os.getenv('PLOT_EDGE', False):
@@ -930,6 +940,79 @@ class InfGenAgentDecoder(nn.Module):
 
     #     return edge_index_sa2sa, r_sa2sa
 
+    def _attend_spatial(self, features, map_features, agent_layer, map_layer,
+                        agent_rel, agent_edges, map_rel, map_edges):
+        # Equations 3-6 apply agent context before map context. Preserve the
+        # released map-first order when the paper profile is not selected.
+        if self.paper_objective:
+            features = agent_layer(features, agent_rel, agent_edges)
+        features = map_layer((map_features, features), map_rel, map_edges)
+        if not self.paper_objective:
+            features = agent_layer(features, agent_rel, agent_edges)
+        return features
+
+    def _next_token_masks(self, states, valid):
+        """Masks for next motion and temporal controls (Appendix D.1)."""
+        valid = valid.bool()
+        if valid.shape[1] < 2:
+            raise ValueError("Next-token supervision requires at least two timesteps")
+        motion = valid & valid.roll(-1, 1) & valid.roll(1, 1)
+        controls = motion.clone()
+        num_steps = valid.shape[1]
+        for row, step in torch.nonzero(states == self.enter_state).tolist():
+            controls[row, :step] = False
+            motion[row, step] = controls[row, step] = True
+            if step + 1 < num_steps:
+                next_valid = valid[row, step + 2] if step + 2 < num_steps else False
+                motion[row, step + 1] = controls[row, step + 1] = next_valid
+        for row, step in torch.nonzero(states == self.exit_state).tolist():
+            motion[row, step] = False
+            if self.paper_objective:
+                # The paper excludes EOS and every subsequent NULL control.
+                controls[row, step:] = False
+            else:
+                controls[row, step + 1:] = True
+                controls[row, step] = valid[row, step - 1] if step > 0 else False
+        motion[:, 0] = controls[:, 0] = valid[:, 0] & valid[:, 1]
+        motion[:, -1] = controls[:, -1] = False
+        return motion, controls
+
+    def _decode_control(self, logits, temporal=False):
+        """Decode controls; paper mode samples at temperature one.
+
+        NULL is a training placeholder, not a next action for an active agent.
+        The spatial head instead has just BEGIN_MOTION and ADD_AGENT classes.
+        """
+        if not self.paper_objective:
+            return logits.argmax(dim=-1)
+        offset = 1 if temporal else 0
+        return torch.distributions.Categorical(logits=logits[..., offset:]).sample() + offset
+
+    def _advance_agent_states(self, logits, previous_states, ego_index):
+        next_states = self._decode_control(logits, temporal=True)
+        next_states[next_states == self.valid_state_type.index('exit')] = self.exit_state
+        if not self.use_state_token or self.disable_insertion:
+            next_states[:] = self.valid_state
+        else:
+            # Removal is terminal for this agent ID. Re-entry must be a new
+            # ADD_AGENT operation, never a KEEP prediction on a retired row.
+            retired = (previous_states == self.invalid_state) | (previous_states == self.exit_state)
+            next_states[retired] = self.invalid_state
+        next_states[ego_index] = self.valid_state
+        return next_states
+
+    def _history_states(self, data):
+        """Build a seed whose boundary control cannot reveal future visibility."""
+        raw = data['agent']['state_idx']
+        historical = data['agent'].get('history_state_idx', raw)
+        states = torch.full_like(raw, self.invalid_state)
+        seed_steps = (self.num_historical_steps - 1) // self.shift
+        states[:, :seed_steps] = historical[:, :seed_steps]
+        if seed_steps:
+            boundary = states[:, seed_steps - 1]
+            boundary[boundary == self.exit_state] = self.valid_state
+        return states
+
     def get_inputs(self, data: HeteroData) -> Dict[str, torch.Tensor]:
 
         pos_a = data['agent']['token_pos'].clone()
@@ -944,41 +1027,11 @@ class InfGenAgentDecoder(nn.Module):
         sort_indices = data['agent']['sort_indices']
 
         next_token_index_gt = agent_token_index.roll(shifts=-1, dims=1)
-        next_state_index_gt = agent_token_index.roll(shifts=-1, dims=1)
+        next_state_index_gt = agent_state_index.roll(shifts=-1, dims=1)
 
-        # next token prediction mask
-        bos_token_index = torch.nonzero(agent_state_index == self.enter_state)
-        eos_token_index = torch.nonzero(agent_state_index == self.exit_state)
+        next_token_eval_mask, next_state_eval_mask = self._next_token_masks(agent_state_index, mask)
 
-        # mask for motion tokens
-        next_token_eval_mask = mask.clone()
-        next_token_eval_mask = next_token_eval_mask * next_token_eval_mask.roll(shifts=-1, dims=1) * next_token_eval_mask.roll(shifts=1, dims=1)
-        for bos_token_index_ in bos_token_index:
-            next_token_eval_mask[bos_token_index_[0], bos_token_index_[1] : bos_token_index_[1] + 1] = 1
-            next_token_eval_mask[bos_token_index_[0], bos_token_index_[1] + 1 : bos_token_index_[1] + 2] = \
-                            mask[bos_token_index_[0], bos_token_index_[1] + 2 : bos_token_index_[1] + 3]
-        next_token_eval_mask[eos_token_index[:, 0], eos_token_index[:, 1]] = 0
-
-        # mask for state tokens
-        next_state_eval_mask = mask.clone()
-        next_state_eval_mask = next_state_eval_mask * next_state_eval_mask.roll(shifts=-1, dims=1) * next_state_eval_mask.roll(shifts=1, dims=1)
-        for bos_token_index_ in bos_token_index:
-            next_state_eval_mask[bos_token_index_[0], :bos_token_index_[1]] = 0
-            next_state_eval_mask[bos_token_index_[0], bos_token_index_[1] : bos_token_index_[1] + 1] = 1
-            next_state_eval_mask[bos_token_index_[0], bos_token_index_[1] + 1 : bos_token_index_[1] + 2] = \
-                            mask[bos_token_index_[0], bos_token_index_[1] + 2 : bos_token_index_[1] + 3]
-        for eos_token_index_ in eos_token_index:
-            next_state_eval_mask[eos_token_index_[0], eos_token_index_[1] + 1:] = 1
-            next_state_eval_mask[eos_token_index_[0], eos_token_index_[1] : eos_token_index_[1] + 1] = \
-                            mask[eos_token_index_[0], eos_token_index_[1] - 1 : eos_token_index_[1]]
-
-        # the last timestep is the beginning of the sequence (also the input)
-        next_token_eval_mask[:, 0] = mask[:, 0] * mask[:, 1]
-        next_state_eval_mask[:, 0] = mask[:, 0] * mask[:, 1]
-        next_token_eval_mask[:, -1] = 0
-        next_state_eval_mask[:, -1] = 0
-
-        if next_token_index_gt[next_token_eval_mask].min() < 0:
+        if (next_token_index_gt[next_token_eval_mask] < 0).any():
             raise RuntimeError()
 
         return {'token_pos': pos_a,
@@ -1006,7 +1059,7 @@ class InfGenAgentDecoder(nn.Module):
             batch_sort_indices = sort_indices[ptr[b] : ptr[b + 1]]
             for t in range(num_step):
                 for s in range(self.num_seed_feature):
-                    seq_mask[b * self.num_seed_feature + s, t, batch_sort_indices[s:, t].flatten().long()] = False
+                    seq_mask[b * self.num_seed_feature + s, t, batch_sort_indices[s:, t].flatten().long() + ptr[b]] = False
         if self.seed_attn_to_av:
             seq_mask[..., av_index] = True
         seq_mask = seq_mask.transpose(0, 1).reshape(-1, num_agent + num_graph * self.num_seed_feature)
@@ -1085,12 +1138,14 @@ class InfGenAgentDecoder(nn.Module):
 
         else:
 
-            seq_mask = seq_mask.reshape(num_step, self.num_seed_feature, -1).transpose(0, 1)[..., :-self.num_seed_feature]
-            for s in range(self.num_seed_feature):
+            num_queries = data.num_graphs * self.num_seed_feature
+            seq_mask = seq_mask.reshape(num_step, num_queries, -1).transpose(0, 1)[..., :-num_queries]
+            for s in range(num_queries):
+                scene_mask = data['agent']['batch'] == s // self.num_seed_feature
                 for t in range(num_step):
-                    index = pos_rel_index_gt[seq_mask[s, t], t]
+                    index = pos_rel_index_gt[seq_mask[s, t] & scene_mask, t]
                     data['agent']['agent_occ'][s, t, index[index != -1]] = 1
-                    if t > 0 and s < pos_rel_index_gt_seed.shape[0] and mask_seed[s, t - 1]: # insert agents
+                    if pos_rel_index_gt_seed is not None and t > 0 and s < pos_rel_index_gt_seed.shape[0] and mask_seed[s, t - 1]:
                         data['agent']['agent_occ'][s, t, pos_rel_index_gt_seed[s, t - 1]] = -1
 
         ptr = data['pt_token']['ptr']
@@ -1146,8 +1201,8 @@ class InfGenAgentDecoder(nn.Module):
 
         is_bos = agent_state_index == self.enter_state
         is_eos = agent_state_index == self.exit_state
-        bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0))
-        eos_index = torch.where(is_eos.any(dim=1), torch.argmax(is_eos.long(), dim=1), torch.tensor(num_step - 1)) # not `-1`
+        bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0, device=device))
+        eos_index = torch.where(is_eos.any(dim=1), torch.argmax(is_eos.long(), dim=1), torch.tensor(num_step - 1, device=device)) # not `-1`
 
         temporal_mask = torch.ones_like(mask)
         motion_mask = torch.arange(mask.shape[1]).expand(mask.shape[0], -1).to(device)
@@ -1184,19 +1239,6 @@ class InfGenAgentDecoder(nn.Module):
         #                                                                                 sort_indices, av_index=av_index)
         # edge_index_sa2sa, r_sa2sa = self._build_sa2sa_edge(data, pos_a_s, head_a_s, state_a_s, head_vector_a_s, batch_s, mask=mask_a_s)
 
-        # for i in range(self.num_layers):
-
-        #     feat_a = feat_a.reshape(-1, self.hidden_dim) # (a, t, d) -> (a*t, d)
-        #     feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
-
-        #     feat_a = feat_a.reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
-        #     feat_a = self.pt2a_attn_layers[i]((
-        #         map_enc['x_pt'].repeat_interleave(repeats=num_step, dim=0).reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(
-        #         -1, self.hidden_dim), feat_a), r_pl2a, edge_index_pl2a)
-
-        #     feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
-        #     feat_a = feat_a.reshape(num_step, -1, self.hidden_dim).transpose(0, 1)
-
         # predict next motions
         for i in range(self.num_layers):
 
@@ -1204,11 +1246,13 @@ class InfGenAgentDecoder(nn.Module):
             feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
 
             feat_a = feat_a.reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
-            feat_a = self.pt2a_attn_layers[i]((
+            feat_a = self._attend_spatial(
+                feat_a,
                 map_enc['x_pt'].repeat_interleave(repeats=num_step, dim=0).reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(
-                -1, self.hidden_dim), feat_a), r_pl2a[:npl2a], edge_index_pl2a[:, :npl2a])
-
-            feat_a = self.a2a_attn_layers[i](feat_a, r_a2a[:na2a], edge_index_a2a[:, :na2a])
+                    -1, self.hidden_dim),
+                self.a2a_attn_layers[i], self.pt2a_attn_layers[i],
+                r_a2a[:na2a], edge_index_a2a[:, :na2a], r_pl2a[:npl2a], edge_index_pl2a[:, :npl2a],
+            )
             feat_a = feat_a.reshape(num_step, -1, self.hidden_dim).transpose(0, 1)
 
         feat_ea = feat_a[:-data.num_graphs * self.num_seed_feature]
@@ -1216,7 +1260,7 @@ class InfGenAgentDecoder(nn.Module):
         # next motion token
         next_token_prob = self.token_predict_head(feat_ea) # (a, t, token_size)
         next_token_prob_softmax = torch.softmax(next_token_prob, dim=-1)
-        _, next_token_idx = torch.topk(next_token_prob_softmax, k=10, dim=-1) # (a, t, 10)
+        _, next_token_idx = torch.topk(next_token_prob_softmax, k=min(10, self.token_size), dim=-1) # (a, t, <=10)
 
         next_token_index_gt = agent_token_index.roll(shifts=-1, dims=1)
 
@@ -1229,7 +1273,8 @@ class InfGenAgentDecoder(nn.Module):
         # predict next agents: coarse stage
         grid_agent_occ_gt_seed = grid_pt_occ_gt_seed = None
         if self.use_grid_token:
-            self._build_occ_gt(data, seq_mask, agent_grid_token_idx.long(), edge_index=edge_index_a2a[:, -na2sa:], mode='edge_index')
+            self._build_occ_gt(data, seq_mask, agent_grid_token_idx.long(), edge_index=edge_index_a2a[:, na2a - na2sa:],
+                               mode='prefix' if self.paper_objective else 'edge_index')
             grid_agent_occ_gt_seed = data['agent']['agent_occ']
             grid_pt_occ_gt_seed = data['agent']['map_occ']
 
@@ -1251,10 +1296,13 @@ class InfGenAgentDecoder(nn.Module):
             feat_sa = feat_sa.reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
             if self.use_grid_token:
                 feat_sa = self.occ2sa_attn_layers[i]((occ_embed_a, feat_sa), None, edge_index_occ2sa)
-            feat_sa = self.pt2sa_attn_layers[i]((
+            feat_sa = self._attend_spatial(
+                feat_sa,
                 map_enc['x_pt'].repeat_interleave(repeats=num_step, dim=0).reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(
-                -1, self.hidden_dim), feat_sa), r_pl2a[-npl2sa:], edge_index_pl2a[:, -npl2sa:])
-            feat_sa = self.a2sa_attn_layers[i](feat_sa, r_a2a[-na2sa:], edge_index_a2a[:, -na2sa:])
+                -1, self.hidden_dim),
+                self.a2sa_attn_layers[i], self.pt2sa_attn_layers[i],
+                r_a2a[na2a - na2sa:], edge_index_a2a[:, na2a - na2sa:], r_pl2a[npl2a - npl2sa:], edge_index_pl2a[:, npl2a - npl2sa:],
+            )
             feat_sa = feat_sa.reshape(num_step, -1, self.hidden_dim).transpose(0, 1)
 
         feat_seed = feat_sa[-data.num_graphs * self.num_seed_feature:]
@@ -1285,10 +1333,10 @@ class InfGenAgentDecoder(nn.Module):
 
         # decode grid index of neighbor agents
         if self.use_grid_token:
-            neighbor_agent_grid_index_gt = grid_index_a_p.transpose(0, 1).reshape(-1)[edge_index_a2a[0, -na2sa:]]
-            neighbor_pt_grid_index_gt = data['agent']['pt_grid_token_idx'].reshape(-1)[edge_index_pl2a[0, -npl2sa:]]
-            neighbor_agent_grid_idx = self.grid_index_head(r_a2a[-na2sa:])
-            neighbor_pt_grid_idx = self.grid_index_head(r_pl2a[-npl2sa:])
+            neighbor_agent_grid_index_gt = grid_index_a_p.transpose(0, 1).reshape(-1)[edge_index_a2a[0, na2a - na2sa:]]
+            neighbor_pt_grid_index_gt = data['agent']['pt_grid_token_idx'].reshape(-1)[edge_index_pl2a[0, npl2a - npl2sa:]]
+            neighbor_agent_grid_idx = self.grid_index_head(r_a2a[na2a - na2sa:])
+            neighbor_pt_grid_idx = self.grid_index_head(r_pl2a[npl2a - npl2sa:])
             neighbor_agent_grid_index_eval_mask = torch.zeros_like(neighbor_agent_grid_index_gt).bool()
             neighbor_pt_grid_index_eval_mask = torch.zeros_like(neighbor_pt_grid_index_gt).bool()
             neighbor_agent_grid_index_eval_mask[torch.randperm(neighbor_agent_grid_index_gt.shape[0])[:180]] = True
@@ -1358,11 +1406,13 @@ class InfGenAgentDecoder(nn.Module):
         for i in range(self.seed_layers):
 
             feat_sa = feat_sa.transpose(0, 1).reshape(-1, self.hidden_dim)
-            feat_sa = self.pt2a_attn_layers[i]((
+            feat_sa = self._attend_spatial(
+                feat_sa,
                 map_enc['x_pt'].repeat_interleave(repeats=num_step, dim=0).reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(
-                -1, self.hidden_dim), feat_sa), r_pl2sa, edge_index_pl2sa)
-
-            feat_sa = self.a2a_attn_layers[i](feat_sa, r_a2sa, edge_index_a2sa)
+                -1, self.hidden_dim),
+                self.a2a_attn_layers[i], self.pt2a_attn_layers[i],
+                r_a2sa, edge_index_a2sa, r_pl2sa, edge_index_pl2sa,
+            )
             feat_sa = feat_sa.reshape(num_step, -1, self.hidden_dim).transpose(0, 1)
 
         if self.use_head_token:
@@ -1384,39 +1434,8 @@ class InfGenAgentDecoder(nn.Module):
 
         next_offset_xy_gt_seed = agent_grid_offset_xy.float()
 
-        # next token prediction mask
-        bos_token_index = torch.nonzero(agent_state_index == self.enter_state)
-        eos_token_index = torch.nonzero(agent_state_index == self.exit_state)
-
-        # mask for motion tokens
-        next_token_eval_mask = mask.clone()
-        next_token_eval_mask = next_token_eval_mask * next_token_eval_mask.roll(shifts=-1, dims=1) * next_token_eval_mask.roll(shifts=1, dims=1)
-        for bos_token_index_ in bos_token_index:
-            next_token_eval_mask[bos_token_index_[0], bos_token_index_[1] : bos_token_index_[1] + 1] = 1
-            next_token_eval_mask[bos_token_index_[0], bos_token_index_[1] + 1 : bos_token_index_[1] + 2] = \
-                            mask[bos_token_index_[0], bos_token_index_[1] + 2 : bos_token_index_[1] + 3]
-        next_token_eval_mask[eos_token_index[:, 0], eos_token_index[:, 1]] = 0
-
-        # mask for state tokens
-        next_state_eval_mask = mask.clone()
-        next_state_eval_mask = next_state_eval_mask * next_state_eval_mask.roll(shifts=-1, dims=1) * next_state_eval_mask.roll(shifts=1, dims=1)
-        for bos_token_index_ in bos_token_index:
-            next_state_eval_mask[bos_token_index_[0], :bos_token_index_[1]] = 0
-            next_state_eval_mask[bos_token_index_[0], bos_token_index_[1] : bos_token_index_[1] + 1] = 1
-            next_state_eval_mask[bos_token_index_[0], bos_token_index_[1] + 1 : bos_token_index_[1] + 2] = \
-                            mask[bos_token_index_[0], bos_token_index_[1] + 2 : bos_token_index_[1] + 3]
-        for eos_token_index_ in eos_token_index:
-            next_state_eval_mask[eos_token_index_[0], eos_token_index_[1] + 1:] = 1
-            next_state_eval_mask[eos_token_index_[0], eos_token_index_[1] : eos_token_index_[1] + 1] = \
-                            mask[eos_token_index_[0], eos_token_index_[1] - 1 : eos_token_index_[1]]
-
+        next_token_eval_mask, next_state_eval_mask = self._next_token_masks(agent_state_index, mask)
         next_state_eval_mask_seed = torch.ones_like(next_state_idx_seed[..., 0])
-
-        # the last timestep is the beginning of the sequence (also the input)
-        next_token_eval_mask[:, 0] = mask[:, 0] * mask[:, 1]
-        next_state_eval_mask[:, 0] = mask[:, 0] * mask[:, 1]
-        next_token_eval_mask[:, -1] = 0
-        next_state_eval_mask[:, -1] = 0
         next_state_eval_mask_seed[:, 0] = 0
 
         # no invalid motion token will be supervised
@@ -1606,7 +1625,13 @@ class InfGenAgentDecoder(nn.Module):
                   data: HeteroData,
                   map_enc: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
 
-        filter_mask = data['agent']['state_idx'][:, (self.num_historical_steps - 1) // self.shift - 1] != self.invalid_state
+        if data.num_graphs != 1:
+            raise ValueError("Dynamic inference supports one scenario per batch")
+        seed_states = self._history_states(data)
+        initial_states = seed_states[:, (self.num_historical_steps - 1) // self.shift - 1]
+        filter_mask = initial_states != self.invalid_state
+        observed_valid = data['agent'].get('observed_valid_mask', data['agent']['valid_mask'])
+        filter_mask &= observed_valid[:, self.num_historical_steps - 1]
 
         seed_step_mask = data['agent']['state_idx'][:, (self.num_historical_steps - 1) // self.shift:] == self.enter_state
         # seed_agent_index_per_step = [torch.nonzero(seed_step_mask[:, t]).squeeze(dim=-1) for t in range(seed_step_mask.shape[1])]
@@ -1619,7 +1644,7 @@ class InfGenAgentDecoder(nn.Module):
         agent_valid_mask = data['agent']['raw_agent_valid_mask'][filter_mask].clone() # token_valid_mask
         pos_a = data['agent']['token_pos'][filter_mask].clone() # (a, t, 2)
         token_a = data['agent']['token_idx'][filter_mask].clone() # (a, t)
-        state_a = data['agent']['state_idx'][filter_mask].clone()
+        state_a = seed_states[filter_mask].clone()
         head_a = data['agent']['token_heading'][filter_mask].clone()
         shape_a = data['agent']['shape'][filter_mask].clone()
         type_a = data['agent']['type'][filter_mask].clone()
@@ -1643,10 +1668,17 @@ class InfGenAgentDecoder(nn.Module):
             state_a = torch.cat([state_a, torch.full(pad_shape, self.invalid_state, device=device)], dim=1)
             head_a = torch.cat([head_a, torch.zeros(pad_shape, device=device)], dim=1)
             grid_a = torch.cat([grid_a, torch.full(pad_shape, -1, device=device)], dim=1)
+        elif num_infer_step < num_ori_step:
+            agent_valid_mask = agent_valid_mask[:, :num_infer_step]
+            pos_a = pos_a[:, :num_infer_step]
+            token_a = token_a[:, :num_infer_step]
+            state_a = state_a[:, :num_infer_step]
+            head_a = head_a[:, :num_infer_step]
+            grid_a = grid_a[:, :num_infer_step]
 
         # TODO: support bs > 1 in inference !!!
         num_removed_agent = int((~filter_mask[:data['agent']['av_index']]).sum())
-        data['batch_size_a'] -= num_removed_agent
+        data['batch_size_a'] = filter_mask.sum().reshape(1)
         av_index = data['agent']['av_index'] - num_removed_agent
 
         # make future steps to zero
@@ -1661,7 +1693,7 @@ class InfGenAgentDecoder(nn.Module):
         agent_valid_mask[:, (self.num_historical_steps - 1) // self.shift:] = True
         agent_valid_mask[~eval_mask] = False
         agent_token_index = data['agent']['token_idx'][filter_mask]
-        agent_state_index = data['agent']['state_idx'][filter_mask]
+        agent_state_index = state_a.clone()
 
         (feat_a, agent_token_emb, agent_token_emb_veh, agent_token_emb_ped, agent_token_emb_cyc, categorical_embs,
          trajectory_token_veh, trajectory_token_ped, trajectory_token_cyc) = self._agent_token_embedding(
@@ -1699,8 +1731,8 @@ class InfGenAgentDecoder(nn.Module):
         # find bos and eos index
         is_bos = state_a == self.enter_state
         is_eos = state_a == self.exit_state
-        bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0))
-        eos_index = torch.where(is_eos.any(dim=1), torch.argmax(is_eos.long(), dim=1), torch.tensor(num_infer_step - 1))
+        bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0, device=device))
+        eos_index = torch.where(is_eos.any(dim=1), torch.argmax(is_eos.long(), dim=1), torch.tensor(num_infer_step - 1, device=device))
 
         temporal_mask = torch.ones_like(mask)
         motion_mask = torch.arange(mask.shape[1]).expand(mask.shape[0], mask.shape[1]).to(mask.device)
@@ -1713,6 +1745,7 @@ class InfGenAgentDecoder(nn.Module):
         non_motion_mask[:, self.num_historical_steps // self.shift:] = False
         interact_mask[non_motion_mask] = 0
         interact_mask[state_a == self.enter_state] = 1
+        interact_mask[state_a == self.exit_state] = 0
         interact_mask[av_index] = 1
 
         temporal_mask[:, (self.num_historical_steps - 1) // self.shift:] = 1
@@ -1735,7 +1768,7 @@ class InfGenAgentDecoder(nn.Module):
             next_state_idx_list.append(agent_state_index[:, i : i + 1])
 
         num_seed_feature = 1
-        insert_limit = 10
+        insert_limit = self.buffer_size if self.paper_objective else 10
 
         for t in (
             pbar := tqdm(range(self.num_recurrent_steps_val // self.shift), leave=False, desc='Timestep ...')
@@ -1743,13 +1776,14 @@ class InfGenAgentDecoder(nn.Module):
 
             # 1. insert agents
             num_new_agents = 0
-            next_state_prob_seeds   = torch.zeros(10 + 1, 1, device=device)
-            next_pos_rel_prob_seeds = torch.zeros(10 + 1, 1, self.attr_tokenizer.grid_size, device=device)
-            grid_agent_occ_seeds    = torch.zeros(10 + 1, 1, self.attr_tokenizer.grid_size, device=device)
-            grid_pt_occ_seeds       = torch.zeros(10 + 1, 1, self.attr_tokenizer.grid_size, device=device)
-            grid_agent_occ_gt_seeds = torch.zeros(10 + 1, 1, self.attr_tokenizer.grid_size, device=device)
+            next_state_prob_seeds   = torch.zeros(insert_limit + 1, 1, device=device)
+            next_pos_rel_prob_seeds = torch.zeros(insert_limit + 1, 1, self.attr_tokenizer.grid_size, device=device)
+            grid_agent_occ_seeds    = torch.zeros(insert_limit + 1, 1, self.attr_tokenizer.grid_size, device=device)
+            grid_pt_occ_seeds       = torch.zeros(insert_limit + 1, 1, self.attr_tokenizer.grid_size, device=device)
+            grid_agent_occ_gt_seeds = torch.zeros(insert_limit + 1, 1, self.attr_tokenizer.grid_size, device=device)
 
-            valid_state_mask = state_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t] != self.invalid_state  # TODO: only support bs=1
+            current_states = state_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t]
+            valid_state_mask = (current_states != self.invalid_state) & (current_states != self.exit_state)
             distance = ((pos_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t, :2] - pos_a[av_index, (self.num_historical_steps - 1) // self.shift - 1 + t, :2]) ** 2).sum(-1).sqrt()
             inrange_mask = distance <= self.pl2seed_radius
             seq_valid_mask = valid_state_mask & inrange_mask
@@ -1773,7 +1807,12 @@ class InfGenAgentDecoder(nn.Module):
             while True:
 
                 p += 1
-                if t == 0 or p - 1 >= insert_limit or self.disable_insertion: break
+                if t == 0 or p - 1 >= insert_limit or self.disable_insertion:
+                    break
+                current_states = state_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t]
+                active_count = ((current_states != self.invalid_state) & (current_states != self.exit_state)).sum()
+                if active_count >= self.buffer_size:
+                    break
 
                 # rebuild inference mask since number of agents have changed
                 inference_mask = torch.zeros_like(temporal_mask)
@@ -1782,10 +1821,11 @@ class InfGenAgentDecoder(nn.Module):
                 inference_mask[:, (self.num_historical_steps - 1) // self.shift + t - 1] = True
 
                 # sanity check: make sure seed agents will interact with **all** non-invalid agents
-                assert torch.all(state_a[:, :(self.num_historical_steps - 1) // self.shift + t][
-                                ~interact_mask[:, :(self.num_historical_steps - 1) // self.shift + t]] == self.invalid_state) and \
-                    torch.all(state_a[:, :(self.num_historical_steps - 1) // self.shift + t][
-                                interact_mask[:, :(self.num_historical_steps - 1) // self.shift + t]] != self.invalid_state), \
+                active_states = (state_a != self.invalid_state) & (state_a != self.exit_state)
+                assert torch.all(~active_states[:, :(self.num_historical_steps - 1) // self.shift + t][
+                                ~interact_mask[:, :(self.num_historical_steps - 1) // self.shift + t]]) and \
+                    torch.all(active_states[:, :(self.num_historical_steps - 1) // self.shift + t][
+                                interact_mask[:, :(self.num_historical_steps - 1) // self.shift + t]]), \
                     f"Got wrong with interact mask at scenario {data['scenario_id'][0]} t={t}!"
 
                 temporal_mask = torch.cat([temporal_mask, torch.ones_like(temporal_mask[:1]).repeat(
@@ -1834,7 +1874,7 @@ class InfGenAgentDecoder(nn.Module):
                                                                     interact_mask.clone(),
                                                                     mask_sa=~pad_mask.clone(),
                                                                     inference_mask=inference_mask_sa,
-                                                                    r=self.pl2seed_radius,
+                                                                    r=self.a2sa_radius if self.paper_objective else self.pl2seed_radius,
                                                                     max_num_neighbors=300,
                                                                     seq_index=seq_index,
                                                                     grid_index_a=grid_index_a_p,
@@ -1863,11 +1903,13 @@ class InfGenAgentDecoder(nn.Module):
                     feat_a = feat_a.transpose(0, 1).reshape(-1, self.hidden_dim)
                     if self.use_grid_token:
                         feat_a = self.occ2sa_attn_layers[i]((occ_embed_a, feat_a), None, edge_index_occ2sa)
-                    feat_a = self.pt2sa_attn_layers[i]((
+                    feat_a = self._attend_spatial(
+                        feat_a,
                         map_enc['x_pt'].repeat_interleave(repeats=num_infer_step, dim=0).reshape(-1, num_infer_step, self.hidden_dim).transpose(0, 1).reshape(
-                        -1, self.hidden_dim), feat_a), r_pl2seed, edge_index_pl2seed)
-
-                    feat_a = self.a2sa_attn_layers[i](feat_a, r_seed2a, edge_index_a2seed)
+                        -1, self.hidden_dim),
+                        self.a2sa_attn_layers[i], self.pt2sa_attn_layers[i],
+                        r_seed2a, edge_index_a2seed, r_pl2seed, edge_index_pl2seed,
+                    )
                     feat_a = feat_a.reshape(num_infer_step, -1, self.hidden_dim).transpose(0, 1)
 
                 feat_seed = feat_a[-num_seed_feature:] # (s, t, d)
@@ -1882,7 +1924,7 @@ class InfGenAgentDecoder(nn.Module):
 
                 # insert prob
                 next_state_prob_seed = self.seed_state_predict_head(feat_seed[:, (self.num_historical_steps - 1) // self.shift - 1 + t])
-                next_state_idx_seed = next_state_prob_seed.softmax(dim=-1).argmax(dim=-1, keepdim=True)
+                next_state_idx_seed = self._decode_control(next_state_prob_seed).unsqueeze(-1)
                 next_state_idx_seed[next_state_idx_seed == self.seed_state_type.index('invalid')] = self.invalid_state
                 next_state_idx_seed[next_state_idx_seed == self.seed_state_type.index('enter')] = self.enter_state
                 if int(os.getenv('DEBUG', 0)):
@@ -1903,7 +1945,7 @@ class InfGenAgentDecoder(nn.Module):
                     sample_pos_rel_index = torch.multinomial(topk_pos_rel_prob, 1).to(device)
                     next_pos_rel_idx_seed = next_pos_rel_idx_seed.gather(dim=1, index=sample_pos_rel_index)
                     next_pos_seed = self.attr_tokenizer.decode_pos(next_pos_rel_idx_seed[..., 0], y=ego_pos_t_1, theta_y=ego_head_t_1)
-                    if self.inference_filter_overlap:
+                    if self.inference_filter_overlap and not self.paper_objective:
                         if grid_agent_occ_gt_t_1[next_pos_rel_idx_seed[..., 0]]:  # TODO: only support insert num=1 for each iter!!!
                             feat_a = raw_feat_a.clone()
                             continue
@@ -2050,11 +2092,13 @@ class InfGenAgentDecoder(nn.Module):
                 for i in range(self.seed_layers):
 
                     feat_a = feat_a.transpose(0, 1).reshape(-1, self.hidden_dim)
-                    feat_a = self.pt2a_attn_layers[i]((
+                    feat_a = self._attend_spatial(
+                        feat_a,
                         map_enc['x_pt'].repeat_interleave(repeats=num_infer_step, dim=0).reshape(-1, num_infer_step, self.hidden_dim).transpose(0, 1).reshape(
-                        -1, self.hidden_dim), feat_a), r_pl2sa, edge_index_pl2sa)
-
-                    feat_a = self.a2a_attn_layers[i](feat_a, r_a2sa, edge_index_a2sa)
+                        -1, self.hidden_dim),
+                        self.a2a_attn_layers[i], self.pt2a_attn_layers[i],
+                        r_a2sa, edge_index_a2sa, r_pl2sa, edge_index_pl2sa,
+                    )
                     feat_a = feat_a.reshape(num_infer_step, -1, self.hidden_dim).transpose(0, 1)
 
                 if self.use_head_token:
@@ -2067,7 +2111,7 @@ class InfGenAgentDecoder(nn.Module):
 
                 head_a[-num_new_agent:, (self.num_historical_steps - 1) // self.shift - 1 + t] = next_head_seed
 
-                if self.use_grid_token:
+                if self.use_grid_token and not self.paper_objective:
                     next_offset_xy_seed = self.seed_offset_xy_predict_head(feat_a[-num_new_agent:, (self.num_historical_steps - 1) // self.shift - 1 + t])
                     next_offset_xy_seed = torch.tanh(next_offset_xy_seed) * 2
 
@@ -2139,11 +2183,13 @@ class InfGenAgentDecoder(nn.Module):
                 feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
 
                 feat_a = feat_a.reshape(-1, num_infer_step, self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
-                feat_a = self.pt2a_attn_layers[i]((
+                feat_a = self._attend_spatial(
+                    feat_a,
                     map_enc['x_pt'].repeat_interleave(repeats=num_infer_step, dim=0).reshape(-1, num_infer_step, self.hidden_dim).transpose(0, 1).reshape(
-                    -1, self.hidden_dim), feat_a), r_pl2a, edge_index_pl2a)
-
-                feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
+                    -1, self.hidden_dim),
+                    self.a2a_attn_layers[i], self.pt2a_attn_layers[i],
+                    r_a2a, edge_index_a2a, r_pl2a, edge_index_pl2a,
+                )
                 feat_a = feat_a.reshape(num_infer_step, -1, self.hidden_dim).transpose(0, 1)
 
                 if t == 0:
@@ -2164,13 +2210,11 @@ class InfGenAgentDecoder(nn.Module):
 
             # next state token
             next_state_prob = self.state_predict_head(feat_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t])
-            next_state_idx = next_state_prob.softmax(dim=-1).argmax(dim=-1)
-            next_state_idx[next_state_idx == self.valid_state_type.index('exit')] = self.exit_state
-            next_state_idx[av_index] = self.valid_state # force ego_agent to be valid
-            if not self.use_state_token:
-                next_state_idx[next_state_idx == self.exit_state] = self.valid_state
-            if self.disable_insertion:
-                next_state_idx[:] = self.valid_state
+            next_state_idx = self._advance_agent_states(
+                next_state_prob,
+                state_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t],
+                av_index,
+            )
 
             # convert the predicted token to a 0.5s (6 timesteps) trajectory
             expanded_token_index = next_token_idx[..., None, None, None].expand(-1, -1, 6, 4, 2)
@@ -2219,7 +2263,12 @@ class InfGenAgentDecoder(nn.Module):
 
             # the case that the current predicted state token is invalid/exit
             is_eos = next_state_idx == self.exit_state
-            is_invalid = next_state_idx == self.invalid_state
+            is_invalid = (next_state_idx == self.invalid_state) | is_eos
+
+            # REMOVE discards the motion decoded in this transition. Keep the
+            # EXIT control marker, but expose no simulated motion at that step.
+            pred_traj[is_invalid, t * 5:(t + 1) * 5] = 0.
+            pred_head[is_invalid, t * 5:(t + 1) * 5] = 0.
 
             next_token_idx[is_invalid] = -1
             pos_a[is_invalid, (self.num_historical_steps - 1) // self.shift + t] = 0.
@@ -2229,6 +2278,7 @@ class InfGenAgentDecoder(nn.Module):
 
             mask[is_invalid, (self.num_historical_steps - 1) // self.shift + t] = False # to handle those newly-added agents
             interact_mask[is_invalid, (self.num_historical_steps - 1) // self.shift + t] = False
+            temporal_mask[is_invalid, (self.num_historical_steps - 1) // self.shift + t:] = False
 
             agent_token_emb[is_invalid, (self.num_historical_steps - 1) // self.shift + t] = self.no_token_emb(torch.zeros(1, device=device).long())
 
@@ -2314,7 +2364,7 @@ class InfGenAgentDecoder(nn.Module):
 
         pred_traj[:num_init_agent, 0] = data['agent']['position'][filter_mask, 0, :2]
         pred_head[:num_init_agent, 0] = data['agent']['heading'][filter_mask, 0]
-        pred_state[:num_init_agent, 1 : self.num_historical_steps] = data['agent']['state_idx'][filter_mask, :(self.num_historical_steps - 1) // self.shift].repeat_interleave(repeats=self.shift, dim=1)
+        pred_state[:num_init_agent, 1 : self.num_historical_steps] = seed_states[filter_mask, :(self.num_historical_steps - 1) // self.shift].repeat_interleave(repeats=self.shift, dim=1)
 
         historical_token_idx = data['agent']['token_idx'][filter_mask, :(self.num_historical_steps - 1) // self.shift]
         historical_token_idx[historical_token_idx < 0] = 0
@@ -2336,7 +2386,7 @@ class InfGenAgentDecoder(nn.Module):
 
         # ! build z and valid
         pred_z = torch.zeros_like(pred_traj[..., 0])  # hard code
-        pred_valid = (pred_state != self.invalid_state) & (pred_state != self.enter_state)
+        pred_valid = pred_state == self.valid_state
 
         # ! predefined agent shape
         eval_shape = torch.zeros_like(pred_shape)

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Mapping, Optional, Literal
-from torch_cluster import radius, radius_graph
+from infgen.modules.layers import batched_radius as radius, batched_radius_graph as radius_graph
 from torch_geometric.data import HeteroData, Batch
 from torch_geometric.utils import dense_to_sparse, subgraph
 from scipy.optimize import linear_sum_assignment
@@ -45,6 +45,7 @@ class InfGenOccDecoder(nn.Module):
                  seed_size: int=5,
                  buffer_size: int=32,
                  loss_weight: dict=None,
+                 paper_objective: bool=False,
                  logger=None) -> None:
 
         super(InfGenOccDecoder, self).__init__()
@@ -264,7 +265,7 @@ class InfGenOccDecoder(nn.Module):
         is_last_valid[:, 0] = False
         motion_vector_a[is_last_valid] = -self.motion_gap
 
-        head_a[state_a == self.invalid_state] == self.invalid_head_value
+        head_a = head_a.masked_fill(state_a == self.invalid_state, self.invalid_head_value)
         head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
 
         return motion_vector_a, head_vector_a
@@ -366,7 +367,7 @@ class InfGenOccDecoder(nn.Module):
 
         if not self.temporal_attn_to_invalid:
             is_bos = state_a == self.enter_state
-            bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0))
+            bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0, device=state_a.device))
             history_invalid_mask = torch.arange(mask.shape[1]).expand(mask.shape[0], mask.shape[1]).to(mask.device)
             history_invalid_mask = (history_invalid_mask < bos_index[:, None])
             hist_mask[history_invalid_mask] = False
@@ -387,7 +388,7 @@ class InfGenOccDecoder(nn.Module):
         # for those invalid agents won't predict any motion token, we don't attend to them
         is_bos = state_a == self.enter_state
         is_bos[-num_graph * self.num_seed_feature:] = False
-        bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0))
+        bos_index = torch.where(is_bos.any(dim=1), torch.argmax(is_bos.long(), dim=1), torch.tensor(0, device=state_a.device))
         motion_predict_start_index = torch.clamp(bos_index - self.time_span / self.shift + 1, min=0)
         motion_predict_mask = torch.arange(hist_mask.shape[1]).expand(hist_mask.shape[0], -1).to(hist_mask.device)
         motion_predict_mask = motion_predict_mask >= motion_predict_start_index[:, None]
@@ -416,7 +417,7 @@ class InfGenOccDecoder(nn.Module):
         rel_pos_t[is_invalid_t[edge_index_t[0]] & ~is_invalid_t[edge_index_t[1]]] = -self.motion_gap
         rel_pos_t[~is_invalid_t[edge_index_t[0]] & is_invalid_t[edge_index_t[1]]] = self.motion_gap
         rel_head_t[is_invalid_t[edge_index_t[0]] & ~is_invalid_t[edge_index_t[1]]] = -self.heading_gap
-        rel_head_t[~is_invalid_t[edge_index_t[1]] & is_invalid_t[edge_index_t[1]]] = self.heading_gap
+        rel_head_t[~is_invalid_t[edge_index_t[0]] & is_invalid_t[edge_index_t[1]]] = self.heading_gap
 
         rel_pos_t[is_invalid_t[edge_index_t[0]] & is_invalid_t[edge_index_t[1]]] = self.invalid_motion_value
         rel_head_t[is_invalid_t[edge_index_t[0]] & is_invalid_t[edge_index_t[1]]] = self.invalid_head_value
@@ -468,7 +469,7 @@ class InfGenOccDecoder(nn.Module):
         rel_pos_a2a[is_invalid_s[edge_index_a2a[0]] & ~is_invalid_s[edge_index_a2a[1]]] = -self.motion_gap
         rel_pos_a2a[~is_invalid_s[edge_index_a2a[0]] & is_invalid_s[edge_index_a2a[1]]] = self.motion_gap
         rel_head_a2a[is_invalid_s[edge_index_a2a[0]] & ~is_invalid_s[edge_index_a2a[1]]] = -self.heading_gap
-        rel_head_a2a[~is_invalid_s[edge_index_a2a[1]] & is_invalid_s[edge_index_a2a[1]]] = self.heading_gap
+        rel_head_a2a[~is_invalid_s[edge_index_a2a[0]] & is_invalid_s[edge_index_a2a[1]]] = self.heading_gap
 
         rel_pos_a2a[is_invalid_s[edge_index_a2a[0]] & is_invalid_s[edge_index_a2a[1]]] = self.invalid_motion_value
         rel_head_a2a[is_invalid_s[edge_index_a2a[0]] & is_invalid_s[edge_index_a2a[1]]] = self.invalid_head_value

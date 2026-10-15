@@ -6,11 +6,43 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
+from torch_cluster import radius as _radius, radius_graph as _radius_graph
 
 from infgen.utils.func import weight_init
 
 
 __all__ = ['AttentionLayer', 'FourierEmbedding', 'MLPEmbedding', 'MLPLayer', 'MappingNetwork']
+
+
+def batched_radius(x, y, r, batch_x=None, batch_y=None, **kwargs):
+    """Run native radius search with sorted batch vectors, restoring indices."""
+    order_x = torch.arange(x.shape[0], device=x.device) if batch_x is None else batch_x.argsort(stable=True)
+    order_y = torch.arange(y.shape[0], device=y.device) if batch_y is None else batch_y.argsort(stable=True)
+    edges = _radius(x[order_x], y[order_y], r,
+                    None if batch_x is None else batch_x[order_x],
+                    None if batch_y is None else batch_y[order_y], **kwargs)
+    return torch.stack((order_y[edges[0]], order_x[edges[1]]))
+
+
+def batched_radius_graph(x, r, batch=None, **kwargs):
+    """Preserve node IDs when seed rows make the scene batches unsorted."""
+    if batch is None:
+        return _radius_graph(x, r, **kwargs)
+    order = batch.argsort(stable=True)
+    edges = _radius_graph(x[order], r, batch[order], **kwargs)
+    return order[edges]
+
+
+def masked_loss(criterion, prediction, target, mask):
+    """Apply a mean loss only to supervised entries, including empty scenes.
+
+    An empty set contributes a differentiable zero. Nonfinite losses on a
+    nonempty set are deliberately preserved so numerical failures stay visible.
+    """
+    selected = prediction[mask]
+    if selected.numel() == 0:
+        return selected.sum()
+    return criterion(selected, target[mask])
 
 
 class AttentionLayer(MessagePassing):

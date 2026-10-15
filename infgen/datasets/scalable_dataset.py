@@ -1,9 +1,9 @@
 import os
+import logging
 import pickle
 import torch
 import json
 import pytorch_lightning as pl
-import pandas as pd
 from tqdm import tqdm
 from torch_geometric.data import HeteroData, Dataset
 from torch_geometric.transforms import BaseTransform
@@ -28,13 +28,14 @@ class MultiDataset(Dataset):
                  #  pl2seed_radius: float=None,
                  buffer_size: int=128,
                  scenario_id: str=None,
-                 logger=None) -> None:
+                 logger=None,
+                 meta_infos_path: Optional[str] = None) -> None:
 
         self.disable_invalid = not predict_state
         self.predict_motion = predict_motion
         self.predict_state = predict_state
         self.predict_map = predict_map
-        self.logger = logger
+        self.logger = logger or logging.getLogger(__name__)
         if split not in ('train', 'val', 'test'):
             raise ValueError(f'{split} is not a valid split')
         self.training = split == 'train'
@@ -42,30 +43,52 @@ class MultiDataset(Dataset):
         self._tfrecord_dir = tfrecord_dir
         self.logger.debug('Starting loading dataset')
 
-        raw_dir = os.path.expanduser(os.path.normpath(raw_dir))
-        self._raw_files = sorted(os.listdir(raw_dir))
-
-        # load meta infos and do filter
-        json_path = '~/infgen/data/waymo_processed/meta_infos.json'
-        label = 'training' if split == 'train' else ('validation' if split == 'val' else split)
-        self.meta_infos = json.load(open(json_path, 'r', encoding='utf-8'))[label]
-        self.logger.debug(f"Loaded meta infos from {json_path}")
-        self.available_scenarios = list(self.meta_infos.keys())
-        # self._raw_files = list(tqdm(filter(lambda fn: (
-        #     scenario_id := fn.removesuffix('.pkl') in self.available_scenarios and
-        #     8 <= self.meta_infos[scenario_id]['num_agents'] < self.buffer_size
-        # ), self._raw_files), leave=False))
-        df = pd.DataFrame.from_dict(self.meta_infos, orient='index')
-        available_scenarios_set = set(self.available_scenarios)
-        df_filtered = df[(df.index.isin(available_scenarios_set)) & (df['num_agents'] >= 8) & (df['num_agents'] < self.buffer_size)]
-        valid_scenarios = set(df_filtered.index)
-        if scenario_id is not None:
-            CONSOLE.log(f'Set {scenario_id=}!')
-            valid_scenarios = [scenario_id]
-        self._raw_files = list(tqdm(filter(lambda fn: fn.removesuffix('.pkl') in valid_scenarios, self._raw_files), leave=False))
-        if len(self._raw_files) <= 0:
-            raise RuntimeError(f'Invalid number of data {len(self._raw_files)}!')
-        self._raw_paths = list(map(lambda fn: os.path.join(raw_dir, fn), self._raw_files))
+        # Upstream configs use both a path and a list of paths.
+        raw_dirs = [raw_dir] if isinstance(raw_dir, (str, os.PathLike)) else raw_dir
+        if not raw_dirs:
+            raise ValueError(f'No raw data directory configured for {split}')
+        raw_dirs = [os.path.abspath(os.path.expanduser(os.fspath(path))) for path in raw_dirs]
+        label = {'train': 'training', 'val': 'validation', 'test': 'test'}[split]
+        self.meta_infos = {}
+        self._raw_paths = []
+        for directory in raw_dirs:
+            json_path = (os.path.abspath(os.path.expanduser(meta_infos_path))
+                         if meta_infos_path else os.path.join(os.path.dirname(directory), 'meta_infos.json'))
+            if not os.path.isfile(json_path):
+                if meta_infos_path:
+                    raise FileNotFoundError(f'Explicit metadata file not found: {json_path}')
+                # Raw scenario pickles are sufficient for loading; metadata only
+                # supplies the upstream experiment's optional scenario filter.
+                self.logger.warning(f'No metadata at {json_path}; loading all scenario pickles')
+                self._raw_paths.extend(
+                    os.path.join(directory, filename) for filename in sorted(os.listdir(directory))
+                    if filename.endswith('.pkl') and (scenario_id is None or filename[:-4] == scenario_id)
+                )
+                continue
+            with open(json_path, 'r', encoding='utf-8') as handle:
+                metadata = json.load(handle)
+            # WOMD names the held-out split "testing"; accept older metadata's "test".
+            split_metadata = metadata.get(label, metadata.get('testing') if split == 'test' else None)
+            if split_metadata is None:
+                raise KeyError(f'Metadata {json_path} has no {label!r} split')
+            self.meta_infos.update(split_metadata)
+            self.logger.debug(f"Loaded meta infos from {json_path}")
+            valid_scenarios = {
+                key for key, info in split_metadata.items()
+                if 8 <= info['num_agents'] < self.buffer_size
+            }
+            if scenario_id is not None:
+                CONSOLE.log(f'Set {scenario_id=}!')
+                valid_scenarios = {scenario_id}
+            self._raw_paths.extend(
+                os.path.join(directory, filename) for filename in sorted(os.listdir(directory))
+                if filename.endswith('.pkl') and filename[:-4] in valid_scenarios
+            )
+        self.available_scenarios = list(self.meta_infos)
+        self._raw_files = [os.path.basename(path) for path in self._raw_paths]
+        if not self._raw_paths:
+            raise RuntimeError(f'No scenarios in {raw_dirs} satisfy the upstream filter '
+                               f'8 <= num_agents < {self.buffer_size}')
 
         self.logger.debug(f"The number of {split} dataset is {len(self._raw_paths)}")
         self.logger.debug(f"The buffer size is {self.buffer_size}")
@@ -84,7 +107,7 @@ class MultiDataset(Dataset):
 
     def get(self, idx: int):
         """
-        Load pkl file (each represents a 91s scenario for waymo dataset)
+        Load one preprocessed WOMD scenario (91 frames at 10 Hz).
         """
         with open(self._raw_paths[idx], 'rb') as handle:
             data = pickle.load(handle)
@@ -216,6 +239,7 @@ class MultiDataModule(pl.LightningDataModule):
         self.buffer_size = buffer_size
         self.logger = logger
         self.scenario_id = scenario_id
+        self.meta_infos_path = kwargs.get("meta_infos_path")
 
         self.train_transform = MultiDataModule.transforms[transform](num_historical_steps,
                                                                      num_future_steps,
@@ -233,7 +257,8 @@ class MultiDataModule(pl.LightningDataModule):
                               predict_map=self.predict_map,
                               buffer_size=self.buffer_size,
                               scenario_id=self.scenario_id,
-                              logger=self.logger)
+                              logger=self.logger,
+                              meta_infos_path=self.meta_infos_path)
 
         if stage == 'fit' or stage is None:
             self.train_dataset = MultiDataModule.dataset[self.dataset_class](split='train',

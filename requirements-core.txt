@@ -1,0 +1,15 @@
+# Tested core runtime. Raw WOMD/official metrics use environment.yml on Linux.
+torch==2.5.1
+torch-geometric==2.6.1
+torch-cluster==1.6.3
+torch-scatter==2.1.2
+pytorch-lightning==2.4.0
+torchmetrics==1.4.1
+numpy>=1.23.5,<2
+scipy>=1.10,<1.16
+pandas>=1.5,<3
+PyYAML>=6,<7
+easydict==1.13
+rich>=13,<16
+matplotlib>=3.7,<3.11
+seaborn==0.13.2
